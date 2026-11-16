@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Single-file railway obstacle dashboard. Copy this one file to the Pi and run python3 railway_obstacle_dashboard_single.py. No YOLO is used."""
+"""Local railway obstacle demo dashboard. Safe simulation is the default."""
+import os, re, shlex, subprocess, threading, time
+from pathlib import Path
+from flask import Flask, Response, jsonify, render_template_string, request, Response
+
+ROOT=Path(__file__).resolve().parent
+DATA=ROOT/'data'; UPLOADS=ROOT/'uploads'
+for p in (DATA/'images',DATA/'labels',DATA/'classes',UPLOADS): p.mkdir(parents=True,exist_ok=True)
+app=Flask(__name__,static_folder=None); app.config['MAX_CONTENT_LENGTH']=25*1024*1024
+
+HTML_PAGE = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Railway Safety Control</title><link rel="stylesheet" href="/static/style.css"><link rel="stylesheet" href="/static/labeler.css"></head>\n<body><header><div><span class="eyebrow">RAILWAY · SAFETY CONSOLE</span><h1>Obstacle detection</h1></div><div class="badge {{ \'sim\' if simulate else \'live\' }}">{{ \'SIMULATION MODE\' if simulate else \'HARDWARE MODE\' }}</div></header>\n<main><section class="alert" id="alert"><i></i><div><b id="event">Connecting…</b><small id="statecopy">Checking sensors and camera</small></div><span id="mode-pill">—</span></section>\n<div class="grid"><section class="panel camera"><div class="panelhead"><div><span class="eyebrow">TRACK VIEW</span><h2>Live camera</h2></div><span class="live-dot">● <span id="camera-state">Starting</span></span></div><img src="/video" alt="Camera feed"><p class="hint">Recognized class: <strong id="object">—</strong> <span id="confidence"></span></p><div class="modelrow"><input id="capture-class" value="clear" placeholder="Class name: clear, person, rock"><button class="secondary" onclick="captureImage()">Capture image to dataset</button></div><button class="primary" onclick="trainImageModel()">Train / update image recognizer</button><div id="datasetmsg" class="hint">Capture examples for every class, including clear.</div></section>\n<section class="panel sensors"><div class="panelhead"><div><span class="eyebrow">RANGE SENSORS</span><h2>Track clearance</h2></div><span class="threshold">STOP ≤ {{ stop_cm|int }} cm</span></div><div class="metric"><div class="metricrow"><span>TF-Luna lidar</span><b id="lidar">—</b></div><div class="bar"><i id="lidarbar"></i></div><small>Signal strength <b id="strength">—</b></small></div><div class="metric"><div class="metricrow"><span>HC-SR04 ultrasonic</span><b id="ultra">—</b></div><div class="bar blue"><i id="ultrabar"></i></div><small>Valid range depends on sensor and target surface</small></div><div class="callout">A close reading from either range sensor trips the stop. A camera detection also trips the stop when a trained model is loaded.</div></section>\n<section class="panel controls"><div class="panelhead"><div><span class="eyebrow">MOTOR CONTROL</span><h2>Train controls</h2></div><span id="run-pill" class="run-pill">STOPPED</span></div><div class="buttons"><button class="primary" onclick="post(\'/api/start\')">▶ Start train</button><button class="stop" onclick="post(\'/api/stop\')">■ Stop</button></div><label class="range-label" for="speed">Speed <b><span id="speedval">25</span>% · <span id="speedmode">Slow</span></b></label><input id="speed" type="range" min="10" max="70" value="25" oninput="setSpeed(this.value)"><div class="scale"><span>Slow</span><span>Medium</span><span>Fast</span></div><p class="hint">Starts at slow speed; moves to medium after 5 seconds if still clear. Slider sets the requested speed.</p><button class="reset" onclick="post(\'/api/estop/reset\')">Reset obstacle latch</button></section>\n<section class="panel dataset"><div class="panelhead"><div><span class="eyebrow">PROJECT FILES</span><h2>Raspberry Pi folders</h2></div></div><div id="project-root" class="hint"></div><div id="folder-list" class="folder-list"></div></section>\n<section class="panel code"><div class="panelhead"><div><span class="eyebrow">PI WORKSPACE</span><h2>Thonny &amp; terminal</h2></div></div><p class="hint">Upload a Python file here, then open it in Thonny on the Pi to edit. The command box supports running an uploaded script and installing a Python package.</p><div class="terminal"><div class="termout" id="termout">Ready. Example: python main.py</div><div class="termbottom"><span>pi $</span><input id="command" placeholder="python main.py or pip install ..." onkeydown="if(event.key===\'Enter\')runCommand()"><button onclick="runCommand()">Run</button></div></div><p class="hint">Dashboard command runner is limited. Do not expose it to the public internet.</p></section>\n<section class="panel system"><div class="panelhead"><div><span class="eyebrow">SYSTEM</span><h2>Raspberry Pi</h2></div></div><p class="hint">Shutdown stops the motor output, then powers down the Pi.</p><input id="shut-token" type="password" placeholder="Shutdown token (if configured)"><button class="danger" onclick="shutdownPi()">⏻ Shut down Raspberry Pi</button><div class="fineprint">Use only on a stationary, supervised test rig. This is a prototype dashboard, not railway-certified safety equipment.</div></section></div>\n<footer>Safety demo · Stop threshold {{ stop_cm|int }} cm · Last update <span id="updated">—</span></footer></main><script src="/static/app.js"></script></body></html>\n'
+APP_JS = 'const $=id=>document.getElementById(id);let speedTimer;\nasync function post(url,body={}){try{const r=await fetch(url,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)alert(d.error||\'Request failed\');refresh();return d}catch(e){alert(\'Request failed: \'+e)}}\nasync function setSpeed(v){$(\'speedval\').textContent=v;clearTimeout(speedTimer);speedTimer=setTimeout(()=>post(\'/api/speed\',{speed:+v}),100)}\nasync function refresh(){try{const s=await(await fetch(\'/api/status\')).json();$(\'event\').textContent=s.last_event;$(\'statecopy\').textContent=s.obstacle?\'Stop latched · inspect and reset before restart\':s.running?\'Train running · sensors active\':\'Train stopped\';$(\'alert\').classList.toggle(\'warn\',s.obstacle);$(\'mode-pill\').textContent=s.running?\'MOTOR ENABLED\':\'MOTOR OFF\';$(\'run-pill\').textContent=s.running?\'RUNNING\':\'STOPPED\';$(\'run-pill\').classList.toggle(\'on\',s.running);$(\'object\').textContent=s.object;$(\'confidence\').textContent=s.confidence?`${s.confidence}% similarity (not probability)`:\'\';$(\'lidar\').textContent=s.lidar_cm==null?\'No reading\':`${Number(s.lidar_cm).toFixed(1)} cm`;$(\'ultra\').textContent=s.ultrasonic_cm==null?\'No reading\':`${Number(s.ultrasonic_cm).toFixed(1)} cm`;$(\'strength\').textContent=s.lidar_strength||\'—\';$(\'camera-state\').textContent=s.simulate?\'Simulated\':\'Live / initializing\';$(\'updated\').textContent=new Date().toLocaleTimeString();$(\'speed\').value=s.speed;$(\'speedval\').textContent=s.speed;$(\'speedmode\').textContent=s.mode[0].toUpperCase()+s.mode.slice(1);for(const [id,n] of [[\'lidarbar\',s.lidar_cm],[\'ultrabar\',s.ultrasonic_cm]])$(id).style.width=n==null?\'0%\':Math.max(3,Math.min(100,(1-n/400)*100))+\'%\'}catch(e){$(\'event\').textContent=\'Dashboard connection lost\'}}\nasync function captureImage(){const name=$(\'capture-class\').value.trim();if(!name)return alert(\'Enter an object class. Use clear for an empty track image.\');const d=await post(\'/api/capture\',{class:name});if(d.ok){$(\'datasetmsg\').textContent=`Saved ${d.name} in ${d.location}`;browseFolders()}}\nasync function trainImageModel(){const d=await post(\'/api/train\');if(d.ok)$(\'datasetmsg\').textContent=`Recognizer trained on ${d.samples} images across: ${d.classes.join(\', \')}`}\nasync function browseFolders(path=\'\'){const d=await(await fetch(\'/api/tree?path=\'+encodeURIComponent(path))).json();if(!d.items)return;$(\'project-root\').textContent=`Project location on Pi: ${d.root}  ·  Folder: ${d.current}`;$(\'folder-list\').innerHTML=(d.current!==\'.\'?`<button class="folder" onclick="browseFolders(\'${d.current.split(\'/\').slice(0,-1).join(\'/\')}\')">↰ ..</button>`:\'\')+d.items.map(x=>`<button class="folder" onclick="${x.directory?`browseFolders(\'${x.path}\')`:`void 0`}">${x.directory?\'📁\':\'📄\'} ${x.name}${x.size!=null?` <small>${x.size} B</small>`:\'\'}</button>`).join(\'\')}\nasync function runCommand(){const command=$(\'command\').value;if(!command)return;const out=$(\'termout\');out.textContent+=`\\npi $ ${command}\\n`;const d=await post(\'/api/terminal\',{command});out.textContent+=d.output||d.error||\'\';out.scrollTop=out.scrollHeight;$(\'command\').value=\'\'}\nasync function shutdownPi(){if(!confirm(\'Shut down the Raspberry Pi now?\'))return;const d=await post(\'/api/shutdown\',{token:$(\'shut-token\').value});if(d.ok)alert(\'Shutdown requested\')}\nsetInterval(refresh,1000);refresh();browseFolders();\n'
+APP_CSS = "@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap');\n:root{--bg:#0b1014;--panel:#131b20;--edge:#263239;--muted:#91a0a5;--text:#ecf2ef;--green:#7bdfa6;--red:#ff6b67;--blue:#69baf0}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 55% -12%,#1a2d2c 0,transparent 42%),var(--bg);color:var(--text);font:15px 'DM Sans',sans-serif}header{max-width:1200px;margin:auto;padding:36px 28px 25px;display:flex;align-items:center;justify-content:space-between}h1{font-size:31px;letter-spacing:-1px;margin:6px 0 0}h2{font-size:19px;margin:5px 0 0;letter-spacing:-.3px}.eyebrow{font:10px 'DM Mono',monospace;letter-spacing:1.5px;color:#90aaa0}.badge,.run-pill,.threshold{font:10px 'DM Mono',monospace;letter-spacing:1px;padding:9px 12px;border:1px solid var(--edge);border-radius:20px}.sim{color:#ffd784;border-color:#725b2e;background:#342b18}.live{color:var(--green);border-color:#305640;background:#17281d}main{max-width:1200px;padding:0 28px 28px;margin:auto}.alert{display:flex;align-items:center;gap:13px;background:#14221d;border:1px solid #2d5540;border-radius:12px;padding:15px 18px;margin-bottom:18px}.alert.warn{background:#2a1b1b;border-color:#693735}.alert i{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 15px currentColor}.alert.warn i{background:var(--red)}.alert div{flex:1}.alert b{display:block;font-size:14px}.alert small{display:block;color:var(--muted);margin-top:3px}.alert>span{font:10px 'DM Mono';color:var(--muted)}.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}.panel{background:linear-gradient(150deg,#172127,#12191e);border:1px solid var(--edge);border-radius:14px;padding:19px;min-width:0}.panelhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:17px}.camera img{width:100%;aspect-ratio:16/9;object-fit:cover;background:#080b0d;border:1px solid #283237;border-radius:8px}.live-dot{font:11px 'DM Mono';color:var(--green)}.hint{font-size:12px;line-height:1.55;color:var(--muted)}.hint strong{color:var(--text)}.threshold{color:#ffd784}.metric{padding:12px 0;border-top:1px solid #29343a}.metricrow{display:flex;justify-content:space-between;font-size:13px;margin-bottom:10px}.metricrow b{font:15px 'DM Mono';color:var(--green)}.bar{height:5px;border-radius:5px;background:#25312e;margin-bottom:8px;overflow:hidden}.bar i{display:block;height:100%;width:55%;background:var(--green);border-radius:5px;transition:width .25s}.bar.blue{background:#1e2c35}.bar.blue i{background:var(--blue)}.metric small{color:var(--muted);font-size:10px}.metric small b{font:inherit;color:var(--blue)}.callout{font-size:11px;line-height:1.5;color:#d8c99a;background:#292719;border:1px solid #4b442c;padding:10px;border-radius:7px;margin-top:12px}.run-pill{color:var(--muted)}.run-pill.on{color:var(--green);border-color:#305640}.buttons{display:flex;gap:9px;margin-bottom:21px}button{border:0;border-radius:7px;padding:11px 14px;font:600 12px 'DM Sans';cursor:pointer;color:var(--text);transition:.15s}button:hover{filter:brightness(1.15);transform:translateY(-1px)}.primary{background:#368d5d;flex:1}.stop{background:#552a2b;color:#ffb3ae;flex:1}.range-label{display:flex;justify-content:space-between;font-size:12px}.range-label b{font:12px 'DM Mono';color:var(--green)}input[type=range]{width:100%;accent-color:#70d49b;margin:16px 0 5px}.scale{display:flex;justify-content:space-between;font:9px 'DM Mono';color:#76868b}.reset,.secondary{background:#25343b;color:#cbd7d5}.reset{width:100%;margin-top:7px}.upload{display:block;padding:13px;border:1px dashed #46585d;border-radius:8px;color:#cbd7d5;font-size:12px;cursor:pointer}.upload input{display:block;margin-top:9px;width:100%;font-size:11px}.secondary{margin-top:8px}.modelrow{display:flex;gap:8px;margin-top:13px}.modelrow select{min-width:0;flex:1;background:#0d1418;border:1px solid var(--edge);color:var(--text);padding:9px;border-radius:6px;font-size:11px}.code code{color:#a4d4bb}.terminal{background:#080d10;border:1px solid #2a383d;border-radius:8px;overflow:hidden}.termout{height:100px;padding:12px;color:#9cb3a7;font:11px/1.6 'DM Mono';overflow:auto;white-space:pre-wrap}.termbottom{display:flex;align-items:center;gap:8px;padding:8px;border-top:1px solid #233036}.termbottom span{font:11px 'DM Mono';color:var(--green)}.termbottom input{flex:1;min-width:0;background:transparent;border:0;color:var(--text);outline:none;font:11px 'DM Mono'}.termbottom button{padding:8px 11px;background:#284e3a}.system input{width:100%;padding:10px;background:#0d1418;border:1px solid var(--edge);color:var(--text);border-radius:7px;margin:4px 0 9px}.danger{background:#682f30;color:#ffd0cc;width:100%}.fineprint{font-size:10px;color:#819096;line-height:1.5;margin-top:12px}footer{text-align:center;color:#6e7d82;padding:20px;font:10px 'DM Mono'}@media(max-width:760px){header{padding:25px 17px 18px}h1{font-size:25px}main{padding:0 14px 22px}.grid{grid-template-columns:1fr}.panel{padding:16px}.badge{font-size:9px}.camera{order:0}}\n"
+LABELER_CSS = '.labeler{margin-top:15px;padding-top:12px;border-top:1px solid var(--edge)}.labeler .modelrow input{width:100px;min-width:90px;background:#0d1418;border:1px solid var(--edge);color:var(--text);border-radius:6px;padding:8px;font-size:11px}.canvaswrap{margin-top:10px;max-height:320px;overflow:auto;background:#070b0d;text-align:center;border:1px solid #2a383d;border-radius:7px}.canvaswrap canvas{display:block;max-width:100%;height:auto;margin:auto;cursor:crosshair}.labeltools{display:flex;align-items:center;gap:7px;margin-top:8px;flex-wrap:wrap}.labeltools span{flex:1;min-width:150px;color:var(--muted);font-size:10px}.labeltools button{padding:8px 10px}.labeltools .primary{flex:0 0 auto}\n'
+
+@app.get("/static/app.js")
+def embedded_js(): return Response(APP_JS, mimetype="application/javascript")
+@app.get("/static/style.css")
+def embedded_css(): return Response(APP_CSS, mimetype="text/css")
+@app.get("/static/labeler.css")
+def embedded_labeler_css(): return Response(LABELER_CSS, mimetype="text/css")
+SIMULATE=os.getenv('RAILWAY_SIMULATE','1')!='0'; STOP_CM=float(os.getenv('STOP_DISTANCE_CM','60'))
+lock=threading.RLock(); camera_lock=threading.Lock(); stop_event=threading.Event(); motors=sensors=camera=classifier=None
+state={'running':False,'speed':25,'mode':'slow','obstacle':False,'object':'Clear','confidence':0,'lidar_cm':None,'ultrasonic_cm':None,'lidar_strength':0,'last_event':'Ready','estop':False}
+
+# ---- Inlined hardware.py and classifier.py (single-file build) ----
+"""Raspberry Pi 5 inputs: TF-Luna UART on GPIO14/15 and HC-SR04 on GPIO23/24."""
+import time
+
+class SensorSuite:
+    def __init__(self):
+        # TF-Luna 9-byte UART frame at the Pi's primary UART (physical 8/10).
+        import serial
+        from gpiozero import DistanceSensor
+        self.uart=serial.Serial('/dev/serial0',115200,timeout=.04)
+        self.ultra=DistanceSensor(echo=24,trigger=23,max_distance=4,threshold_distance=.6)
+        self.strength=0; self._lidar=None
+    def get_distance(self):
+        # Bound the read time; discard bytes until a valid frame/checksum is found.
+        end=time.monotonic()+.025
+        while time.monotonic()<end:
+            b=self.uart.read(1)
+            if b!=b'Y':continue
+            rest=self.uart.read(8)
+            if len(rest)!=8 or rest[0]!=0x59:continue
+            packet=b+rest
+            if sum(packet[:8])&255 != packet[8]:continue
+            cm=packet[2]+(packet[3]<<8); self.strength=packet[4]+(packet[5]<<8)
+            self._lidar=float(cm) if cm>0 else None
+            return self._lidar
+        return self._lidar
+    def get_ultrasonic(self):
+        try:return round(self.ultra.distance*100,1)
+        except Exception:return None
+
+"""Small OpenCV HOG + nearest-neighbor image classifier; no YOLO or cloud service."""
+from pathlib import Path
+import cv2, numpy as np
+
+def feature(image):
+    gray=cv2.cvtColor(image,cv2.COLOR_RGB2GRAY) if image.ndim==3 else image
+    gray=cv2.resize(gray,(96,96),interpolation=cv2.INTER_AREA)
+    hog=cv2.HOGDescriptor((96,96),(24,24),(12,12),(12,12),9)
+    vector=hog.compute(gray).reshape(-1).astype(np.float32)
+    return vector/(np.linalg.norm(vector)+1e-8)
+
+class ImageClassifier:
+    def __init__(self,features,labels,classes):self.features=features;self.labels=labels;self.classes=classes;self.samples=len(labels)
+    @classmethod
+    def train(cls,root,savepath):
+        feats=[]; labs=[]; names=sorted(p.name for p in Path(root).iterdir() if p.is_dir())
+        if len(names)<2 or 'clear' not in names:raise ValueError('Create at least two class folders, including clear, and capture examples in each.')
+        for idx,name in enumerate(names):
+            images=list((Path(root)/name).glob('*.jpg'))+list((Path(root)/name).glob('*.png'))
+            if len(images)<3:raise ValueError(f"Add at least 3 labeled images to data/classes/{name}/")
+            for path in images:
+                im=cv2.imread(str(path))
+                if im is not None:feats.append(feature(cv2.cvtColor(im,cv2.COLOR_BGR2RGB)));labs.append(idx)
+        if len(set(labs))<2:raise ValueError('Need readable images in at least two classes')
+        model=cls(np.asarray(feats,dtype=np.float32),np.asarray(labs),names)
+        np.savez_compressed(savepath,features=model.features,labels=model.labels,classes=np.array(names));return model
+    @classmethod
+    def load(cls,path):
+        d=np.load(path);return cls(d['features'],d['labels'],d['classes'].tolist())
+    def predict(self,image):
+        f=feature(image);dist=np.linalg.norm(self.features-f,axis=1);i=int(np.argmin(dist))
+        # Distance is a similarity heuristic, not a calibrated probability.
+        confidence=float(max(0,min(1,1-float(dist[i]))))
+        return self.classes[int(self.labels[i])],confidence
+
+
+def set_speed(n):
+    with lock:
+        state['speed']=max(0,min(100,int(n))); state['mode']='slow' if state['speed']<=35 else 'medium' if state['speed']<=70 else 'fast'
+        v=state['speed']/100 if state['running'] and not state['obstacle'] and not state['estop'] else 0
+    if motors: motors.value=v
+
+def trip(reason,obj='Obstacle',confidence=0):
+    with lock: state.update(running=False,obstacle=True,object=obj,confidence=round(float(confidence),1),last_event=reason)
+    stop_event.set()
+    if motors: motors.value=0
+
+def start_train():
+    with lock:
+        if state['estop'] or state['obstacle']: return False
+        state.update(running=True,obstacle=False,object='Clear',confidence=0,last_event='Train started'); stop_event.clear()
+    set_speed(state['speed'])
+    # Controlled initial crawl, then medium speed if the train remains clear.
+    threading.Thread(target=_ramp_to_medium,daemon=True).start()
+    return True
+
+def _ramp_to_medium():
+    time.sleep(5)
+    with lock:
+        if state['running'] and not state['obstacle'] and not state['estop'] and state['speed']==25:
+            state['speed']=50; state['mode']='medium'; value=.5
+        else:value=None
+    if value is not None and motors:motors.value=value
+
+def sensor_loop():
+    while True:
+        try:
+            if SIMULATE:
+                with lock: state.update(lidar_cm=250.0,ultrasonic_cm=248.0,lidar_strength=900)
+                time.sleep(.15); continue
+            lidar=sensors.get_distance() if sensors else None; ultra=sensors.get_ultrasonic() if sensors else None
+            with lock: state.update(lidar_cm=lidar,ultrasonic_cm=ultra,lidar_strength=getattr(sensors,'strength',0))
+            close=[x for x in (lidar,ultra) if x is not None and 0<x<=STOP_CM]
+            if close: trip(f'Range threshold reached ({min(close):.0f} cm)','Object in track',100)
+            elif classifier and camera:
+                with camera_lock: frame=camera.capture_array()
+                name,confidence=classifier.predict(frame)
+                with lock: state.update(object=name,confidence=round(confidence*100,1))
+                if name.lower()!='clear' and confidence>=.55:trip(f'Camera recognized {name}',name,confidence*100)
+            time.sleep(.04)
+        except Exception as e:
+            trip('Sensor fault: motor disabled','Sensor fault'); time.sleep(.5)
+
+def init_hardware():
+    global motors,sensors,camera
+    if SIMULATE:return
+    from gpiozero import PWMOutputDevice,DigitalOutputDevice
+    motors=PWMOutputDevice(18,frequency=1000,initial_value=0)
+    # GPIO5 -> IN1, GPIO6 -> IN3; IN2/IN4 must be held LOW at the driver.
+    motors.direction_pins=(DigitalOutputDevice(5,initial_value=True),DigitalOutputDevice(6,initial_value=True))
+    sensors=SensorSuite()
+    try:
+        from picamera2 import Picamera2
+        camera=Picamera2(); camera.configure(camera.create_video_configuration(main={'size':(640,480),'format':'RGB888'})); camera.start()
+    except Exception as e: print('Camera unavailable:',e)
+
+@app.get('/')
+def index(): return render_template_string(HTML_PAGE,simulate=SIMULATE,stop_cm=STOP_CM)
+@app.get('/api/status')
+def status():
+    with lock:return jsonify(state|{'simulate':SIMULATE,'stop_cm':STOP_CM})
+@app.post('/api/start')
+def api_start():
+    return (jsonify(ok=True) if start_train() else (jsonify(ok=False,error='Emergency stop is latched; reset it first'),409))
+@app.post('/api/stop')
+def api_stop():
+    with lock:state.update(running=False,last_event='Stopped by operator')
+    if motors:motors.value=0
+    stop_event.set();return jsonify(ok=True)
+@app.post('/api/estop/reset')
+def estop_reset():
+    with lock:state.update(estop=False,obstacle=False,object='Clear',last_event='Latch reset; inspect track before restart')
+    stop_event.clear();return jsonify(ok=True)
+@app.post('/api/speed')
+def api_speed():
+    try:n=int(request.json['speed'])
+    except Exception:return jsonify(error='speed must be an integer'),400
+    set_speed(n);return jsonify(ok=True,speed=state['speed'],mode=state['mode'])
+@app.post('/api/upload')
+def upload():
+    f=request.files.get('file')
+    if not f or not f.filename:return jsonify(error='Choose a file'),400
+    name=Path(f.filename).name
+    if not re.fullmatch(r'[\w .()-]{1,100}\.(py|jpg|jpeg|png)',name,re.I):return jsonify(error='Allowed: Python files and images'),400
+    dest=DATA/'images' if Path(name).suffix.lower() in ('.jpg','.jpeg','.png') else UPLOADS
+    f.save(dest/name);return jsonify(ok=True,name=name,location=str(dest.relative_to(ROOT)))
+@app.get('/api/files')
+def files():return jsonify(files=sorted(p.name for p in UPLOADS.iterdir() if p.is_file()))
+@app.get('/api/dataset/images')
+def dataset_images():return jsonify(images=sorted(p.name for p in (DATA/'images').iterdir() if p.suffix.lower() in ('.jpg','.jpeg','.png')))
+@app.get('/dataset/images/<path:name>')
+def dataset_image(name):
+    if Path(name).suffix.lower() not in ('.jpg','.jpeg','.png'):return 'Not found',404
+    return __import__('flask').send_from_directory(DATA/'images',Path(name).name)
+@app.post('/api/dataset/labels')
+def save_labels():
+    body=request.json or {}; name=Path(body.get('image','')).name; boxes=body.get('boxes',[])
+    image=DATA/'images'/name
+    if image.suffix.lower() not in ('.jpg','.jpeg','.png') or not image.is_file():return jsonify(error='Image not found'),404
+    classes=[]; normalized=[]
+    try:
+        for b in boxes:
+            cls=str(b['class']).strip()
+            vals=[float(b[k]) for k in ('x','y','w','h')]
+            if not cls or any(v<0 or v>1 for v in vals) or vals[2]<=0 or vals[3]<=0:raise ValueError('Invalid class or box coordinates')
+            if cls not in classes:classes.append(cls)
+            normalized.append((cls,*vals))
+    except (KeyError,TypeError,ValueError) as e:return jsonify(error=str(e)),400
+    class_file=DATA/'classes.txt'; existing=class_file.read_text().splitlines() if class_file.exists() else []
+    all_classes=existing[:]
+    for c in classes:
+        if c not in all_classes:all_classes.append(c)
+    class_file.write_text('\n'.join(all_classes)+'\n')
+    lines=[f"{all_classes.index(c)} {x:.6f} {y:.6f} {w:.6f} {h:.6f}" for c,x,y,w,h in normalized]
+    (DATA/'labels'/(image.stem+'.txt')).write_text('\n'.join(lines)+('\n' if lines else ''))
+    return jsonify(ok=True,boxes=len(lines),classes=all_classes)
+@app.get('/api/classes')
+def classes():return jsonify(classes=sorted(p.name for p in (DATA/'classes').iterdir() if p.is_dir()))
+@app.post('/api/capture')
+def capture_image():
+    if camera is None:return jsonify(error='No live camera is connected. Start in hardware mode and check the Pi Camera.'),503
+    try:
+        from PIL import Image
+        with camera_lock: frame=camera.capture_array()
+        label=re.sub(r'[^a-zA-Z0-9_-]+','_',str((request.json or {}).get('class','')).strip()).strip('_').lower()
+        if not label:return jsonify(error='Enter an object name (use clear for a clear track)'),400
+        folder=DATA/'classes'/label;folder.mkdir(parents=True,exist_ok=True)
+        stamp=time.strftime('%Y%m%d_%H%M%S');path=folder/f'{label}_{stamp}.jpg'
+        Image.fromarray(frame).save(path,quality=92)
+        return jsonify(ok=True,name=path.name,location=str(path.relative_to(ROOT)),class_name=label)
+    except Exception as e:return jsonify(error=f'Image capture failed: {e}'),500
+@app.post('/api/train')
+def train_classifier():
+    global classifier
+    try:
+        classifier=ImageClassifier.train(DATA/'classes',DATA/'classifier.npz')
+        return jsonify(ok=True,classes=classifier.classes,samples=classifier.samples)
+    except Exception as e:return jsonify(error=f'Image capture failed: {e}'),500
+@app.get('/api/tree')
+def project_tree():
+    rel=(request.args.get('path','') or '').strip('/\\')
+    target=(ROOT/rel).resolve()
+    if target!=ROOT and ROOT not in target.parents:return jsonify(error='Path outside project'),400
+    if not target.is_dir():return jsonify(error='Folder not found'),404
+    items=[]
+    for p in sorted(target.iterdir(),key=lambda x:(not x.is_dir(),x.name.lower())):
+        items.append({'name':p.name,'directory':p.is_dir(),'path':str(p.relative_to(ROOT)),'size':p.stat().st_size if p.is_file() else None})
+    return jsonify(root=str(ROOT),current=str(target.relative_to(ROOT)) if target!=ROOT else '.',items=items)
+@app.get('/video')
+def video():
+    def frames():
+        while True:
+            frame=None
+            if camera:
+                try:
+                    import cv2
+                    with camera_lock: captured=camera.capture_array()
+                    image=cv2.cvtColor(captured,cv2.COLOR_RGB2BGR);ok,b=cv2.imencode('.jpg',image)
+                    if ok:frame=b.tobytes()
+                except Exception:pass
+            elif SIMULATE:
+                import cv2,numpy as np
+                image=np.zeros((360,640,3),dtype=np.uint8);image[:]=(25,30,40)
+                cv2.putText(image,'CAMERA SIMULATION - NO LIVE IMAGE',(55,180),cv2.FONT_HERSHEY_SIMPLEX,.8,(180,195,215),2)
+                _,b=cv2.imencode('.jpg',image);frame=b.tobytes()
+            if frame:yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'+frame+b'\r\n'
+            time.sleep(.08)
+    return Response(frames(),mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.post('/api/terminal')
+def terminal():
+    raw=(request.json or {}).get('command','').strip()
+    try:args=shlex.split(raw,posix=os.name!='nt')
+    except ValueError as e:return jsonify(error=str(e)),400
+    if not args:return jsonify(output='')
+    if args[0] not in ('python','python3','pip','pip3'):return jsonify(error='Supported: python <uploaded.py>, pip install <package>'),400
+    if args[0].startswith('python'):
+        if len(args)<2 or not args[1].endswith('.py') or any(x in args for x in ('-c','-m')):return jsonify(error='Run an uploaded .py file by name'),400
+        path=(UPLOADS/Path(args[1]).name).resolve()
+        if path.parent!=UPLOADS.resolve() or not path.exists():return jsonify(error='Python file must be uploaded first'),400
+        args[1]=str(path)
+    elif len(args)<3 or args[1]!='install':return jsonify(error='Only pip install <package> is supported'),400
+    try:
+        r=subprocess.run(args,cwd=ROOT,capture_output=True,text=True,timeout=20,shell=False)
+        return jsonify(output=(r.stdout+r.stderr)[-8000:],code=r.returncode)
+    except subprocess.TimeoutExpired:return jsonify(error='Command exceeded 20 seconds'),408
+@app.post('/api/shutdown')
+def shutdown():
+    token=os.getenv('RAILWAY_SHUTDOWN_TOKEN','')
+    if not token or (request.json or {}).get('token')!=token:return jsonify(error='Shutdown token not configured or incorrect'),403
+    if motors:motors.value=0
+    subprocess.Popen(['sudo','-n','shutdown','-h','now']);return jsonify(ok=True)
+
+if __name__=='__main__':
+    if (DATA/'classifier.npz').exists():
+        try:
+                classifier=ImageClassifier.load(DATA/'classifier.npz')
+        except Exception as e:print('Saved image classifier unavailable:',e)
+    init_hardware();threading.Thread(target=sensor_loop,daemon=True).start()
+    host='0.0.0.0' if os.getenv('RAILWAY_BIND')=='0.0.0.0' else '127.0.0.1'
+    app.run(host=host,port=int(os.getenv('PORT','5000')),threaded=True)
