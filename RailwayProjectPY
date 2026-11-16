@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""
+railwayproject.py - Railway track obstacle detection (single file)
+
+ON THE RASPBERRY PI (web control panel):
+    python3 railwayproject.py
+    Then open http://<pi-ip>:5000 and enter the token below.
+
+ON YOUR PC (train the model from the dataset folder copied from the Pi):
+    pip install tensorflow
+    python3 railwayproject.py train
+    Then copy the model/ folder to the Pi, next to this file.
+
+Wiring (BCM GPIO numbers):
+    HC-SR04 TRIG -> GPIO23, ECHO -> GPIO24 (through voltage divider)
+    L298N ENA+ENB -> GPIO18 (PWM speed), IN1 -> GPIO5, IN3 -> GPIO6
+    L298N IN2 and IN4 -> GND (forward only)
+    TF-Luna UART on /dev/serial0 (TX -> pin 10 / GPIO15, RX -> pin 8 / GPIO14)
+
+SAFETY: this is a prototype, not a certified railway signalling system.
+Test with the wheels lifted. Add a hardware emergency-stop switch that cuts motor power.
+The web terminal gives full shell access, so change the token and do not expose port 5000 to the internet.
+"""
+import sys
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+
+# ============================================================
+# CONFIGURATION (edit here)
+# ============================================================
+CFG = {
+    "token": "change-me-1234",          # web page access token - CHANGE THIS
+    "stop_distance_cm": 80,             # emergency stop when obstacle is closer than this
+    "slow_zone_cm": 200,                # creep speed when obstacle is inside this distance
+    "slow_speed": 0.35,                 # 0.0 - 1.0
+    "medium_speed": 0.65,               # cruising speed (also the default max speed)
+    "ramp_seconds": 3,                  # slow start time after pressing Start
+    "lidar_min_strength": 100,          # ignore TF-Luna readings weaker than this
+    "sensor_timeout_s": 0.5,            # treat a sensor as faulty if no data for this long
+    "obstacle_labels": ["obstacle", "person", "animal", "stone", "vehicle"],
+    "vision_confidence": 0.7,
+}
+
+
+# ============================================================
+# TRAINING (runs on PC only: python3 railwayproject.py train)
+# ============================================================
+def train_model():
+    import tensorflow as tf
+
+    data_dir = str(BASE / "dataset")
+    size, batch = (224, 224), 16
+
+    train_ds, val_ds = tf.keras.utils.image_dataset_from_directory(
+        data_dir, image_size=size, batch_size=batch,
+        validation_split=0.2, subset="both", seed=42)
+    labels = train_ds.class_names
+    autotune = tf.data.AUTOTUNE
+
+    aug = tf.keras.Sequential([
+        tf.keras.layers.RandomFlip("horizontal"),
+        tf.keras.layers.RandomRotation(0.05),
+        tf.keras.layers.RandomContrast(0.2),
+    ])
+    base = tf.keras.applications.MobileNetV2(input_shape=size + (3,), include_top=False, weights="imagenet")
+    base.trainable = False
+
+    inputs = tf.keras.Input(shape=size + (3,))
+    x = aug(inputs)
+    x = tf.keras.layers.Rescaling(1 / 127.5, offset=-1)(x)   # model takes raw 0-255 pixels
+    x = base(x, training=False)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    outputs = tf.keras.layers.Dense(len(labels), activation="softmax")(x)
+    model = tf.keras.Model(inputs, outputs)
+    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    model.fit(train_ds.prefetch(autotune), validation_data=val_ds.prefetch(autotune), epochs=8)
+
+    (BASE / "model").mkdir(exist_ok=True)
+    tflite_bytes = tf.lite.TFLiteConverter.from_keras_model(model).convert()
+    (BASE / "model" / "model.tflite").write_bytes(tflite_bytes)
+    (BASE / "model" / "labels.txt").write_text("\n".join(labels))
+    print("Saved model/model.tflite and model/labels.txt. Labels:", labels)
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "train":
+    train_model()
+    sys.exit(0)
+
+
+# ============================================================
+# IMPORTS FOR THE RASPBERRY PI
+# ============================================================
+import collections
+import re
+import subprocess
+import threading
+import time
+
+import cv2
+import numpy as np
+import serial
+from flask import Flask, Response, abort, jsonify, request
+from gpiozero import DigitalOutputDevice, DistanceSensor, PWMOutputDevice
+from picamera2 import Picamera2
+from werkzeug.utils import secure_filename
+
+
+# ============================================================
+# SENSORS
+# ============================================================
+class HCSR04:
+    """HC-SR04 ultrasonic sensor. ECHO must go through the voltage divider."""
+
+    def __init__(self, trig, echo, max_m=2.0):
+        self.max_m = max_m
+        self.s = DistanceSensor(echo=echo, trigger=trig, max_distance=max_m, queue_len=3)
+        self.last_ok = 0
+
+    def read(self):
+        """Return distance in cm, or None if there is no echo."""
+        m = self.s.distance
+        if m is None or m >= self.max_m * 0.98:
+            return None
+        self.last_ok = time.time()
+        return round(m * 100, 1)
+
+
+class TFLuna(threading.Thread):
+    """TF-Luna LiDAR over UART (9-byte frames at 115200 baud)."""
+
+    def __init__(self, port="/dev/serial0", baud=115200):
+        super().__init__(daemon=True)
+        self.ser = serial.Serial(port, baud, timeout=0.1)
+        self.distance_cm = None
+        self.strength = None
+        self.temp_c = None
+        self.last_ok = 0
+
+    def run(self):
+        buf = bytearray()
+        while True:
+            data = self.ser.read(64)
+            if not data:
+                continue
+            buf.extend(data)
+            if len(buf) > 256:
+                del buf[:-9]
+            while len(buf) >= 9:
+                if buf[0] == 0x59 and buf[1] == 0x59:
+                    frame = buf[:9]
+                    if sum(frame[:8]) & 0xFF == frame[8]:
+                        self.distance_cm = frame[2] | (frame[3] << 8)
+                        self.strength = frame[4] | (frame[5] << 8)
+                        self.temp_c = round((frame[6] | (frame[7] << 8)) / 8 - 256, 1)
+                        self.last_ok = time.time()
+                        del buf[:9]
+                        continue
+                del buf[0]
+
+
+# ============================================================
+# MOTOR (L298N)
+# ============================================================
+class Motor:
+    """ENA+ENB on GPIO18 (speed), IN1 on GPIO5, IN3 on GPIO6. IN2/IN4 tied to GND."""
+
+    def __init__(self):
+        self.ena = PWMOutputDevice(18, frequency=1000)
+        self.in1 = DigitalOutputDevice(5)
+        self.in3 = DigitalOutputDevice(6)
+        self.stop()
+
+    def forward(self, speed):
+        speed = max(0.0, min(1.0, speed))
+        self.in1.on()
+        self.in3.on()
+        self.ena.value = speed
+
+    def stop(self):
+        self.ena.value = 0
+        self.in1.off()
+        self.in3.off()
+
+    @property
+    def pwm(self):
+        return self.ena.value
+
+
+# ============================================================
+# CAMERA AND VISION
+# ============================================================
+class Camera(threading.Thread):
+    """Continuously grabs frames from the Pi Camera (BGR, like OpenCV)."""
+
+    def __init__(self, size=(640, 480)):
+        super().__init__(daemon=True)
+        self.picam = Picamera2()
+        self.picam.configure(self.picam.create_video_configuration(main={"size": size, "format": "RGB888"}))
+        self.picam.start()
+        self._frame = None
+        self._lock = threading.Lock()
+
+    def run(self):
+        while True:
+            frame = self.picam.capture_array()
+            with self._lock:
+                self._frame = frame
+
+    def get(self):
+        with self._lock:
+            return None if self._frame is None else self._frame.copy()
+
+
+def load_model(path):
+    if not path.exists():
+        return None
+    try:
+        from tflite_runtime.interpreter import Interpreter
+    except ImportError:
+        try:
+            from ai_edge_litert.interpreter import Interpreter
+        except ImportError:
+            from tensorflow.lite import Interpreter
+    interp = Interpreter(model_path=str(path))
+    interp.allocate_tensors()
+    return interp
+
+
+class Vision(threading.Thread):
+    """
+    Detects what is on the track in front of the train.
+    - If model/model.tflite exists (trained from your dataset), it classifies the frame.
+    - Otherwise it uses motion detection (MOG2) to flag a large new object as "obstacle".
+    """
+
+    def __init__(self, cam):
+        super().__init__(daemon=True)
+        self.cam = cam
+        self.dataset = BASE / "dataset"
+        self.dataset.mkdir(exist_ok=True)
+        self.interp = load_model(BASE / "model" / "model.tflite")
+        label_file = BASE / "model" / "labels.txt"
+        self.labels = label_file.read_text().splitlines() if self.interp else []
+        self.mode = "tflite" if self.interp else "motion"
+        self.bg = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=40, detectShadows=False)
+        self.seen = 0
+        self.label = "clear"
+        self.confidence = 0.0
+
+    def roi(self, frame):
+        """Only look at the track area in front of the train (lower-middle of the image)."""
+        h, w = frame.shape[:2]
+        return frame[int(h * 0.35):, int(w * 0.2):int(w * 0.8)]
+
+    def classify(self, roi):
+        if self.interp:
+            inp = self.interp.get_input_details()[0]
+            _, h, w, _ = inp["shape"]
+            rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            x = cv2.resize(rgb, (w, h)).astype(np.float32)[None]
+            self.interp.set_tensor(inp["index"], x)
+            self.interp.invoke()
+            out = self.interp.get_tensor(self.interp.get_output_details()[0]["index"])[0]
+            i = int(np.argmax(out))
+            return self.labels[i], float(out[i])
+
+        # Motion fallback
+        self.seen += 1
+        fg = self.bg.apply(roi)
+        if self.seen < 60:  # learn the empty track first
+            return "clear", 0.0
+        ratio = np.count_nonzero(fg) / fg.size
+        if ratio > 0.15:
+            return "obstacle", 1.0
+        return "clear", 0.0
+
+    def run(self):
+        while True:
+            try:
+                frame = self.cam.get()
+                if frame is not None:
+                    self.label, self.confidence = self.classify(self.roi(frame))
+            except Exception as e:
+                print("Vision error:", e)
+            time.sleep(0.2)
+
+    def capture(self, label):
+        frame = self.cam.get()
+        if frame is None:
+            raise RuntimeError("No camera frame yet")
+        d = self.dataset / label
+        d.mkdir(parents=True, exist_ok=True)
+        name = f"{int(time.time() * 1000)}.jpg"
+        cv2.imwrite(str(d / name), frame)
+        return name
+
+    def counts(self):
+        return {p.name: len(list(p.glob("*.jpg"))) for p in sorted(self.dataset.iterdir()) if p.is_dir()}
+
+
+# ============================================================
+# HARDWARE INSTANCES
+# ============================================================
+motor = Motor()
+us = HCSR04(trig=23, echo=24)
+lidar = TFLuna("/dev/serial0")
+lidar.start()
+cam = Camera()
+cam.start()
+vision = Vision(cam)
+vision.start()
+
+
+# ============================================================
+# TRAIN SAFETY LOGIC (runs 20 times per second)
+# ============================================================
+class Train:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.moving = False
+        self.latched = False
+        self.reason = "Idle - press Start"
+        self.max_speed = CFG["medium_speed"]
+        self.start_time = 0.0
+        self.speed = 0.0
+        self.safe_now = False
+        self.data = {"us_cm": None, "lidar_cm": None, "lidar_strength": None,
+                     "lidar_temp": None, "nearest": None}
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            t = time.time()
+            try:
+                self._step(t)
+            except Exception as e:
+                motor.stop()
+                with self.lock:
+                    self.moving = False
+                    self.latched = True
+                    self.reason = f"Control error: {e}"
+            time.sleep(max(0, 0.05 - (time.time() - t)))
+
+    def _step(self, now):
+        us_cm = us.read()
+        strength = lidar.strength or 0
+        lidar_ok = (lidar.distance_cm is not None
+                    and now - lidar.last_ok < CFG["sensor_timeout_s"]
+                    and strength >= CFG["lidar_min_strength"])
+        lidar_cm = lidar.distance_cm if lidar_ok else None
+
+        readings = [d for d in (us_cm, lidar_cm) if d is not None]
+        nearest = min(readings) if readings else None
+        sensors_ok = bool(readings)
+
+        vision_danger = (vision.label in CFG["obstacle_labels"]
+                         and vision.confidence >= CFG["vision_confidence"])
+        dist_danger = nearest is not None and nearest < CFG["stop_distance_cm"]
+        danger = dist_danger or vision_danger or not sensors_ok
+
+        if dist_danger:
+            why = f"Obstacle at {nearest} cm"
+        elif vision_danger:
+            why = f"Camera sees: {vision.label}"
+        else:
+            why = "Sensor fault - no valid readings"
+
+        with self.lock:
+            self.data = {"us_cm": us_cm, "lidar_cm": lidar_cm, "lidar_strength": strength,
+                         "lidar_temp": lidar.temp_c, "nearest": nearest}
+            self.safe_now = not danger
+
+            if danger:
+                if self.moving or self.latched:
+                    self.moving = False
+                    self.latched = True
+                    self.reason = f"EMERGENCY STOP: {why}"
+                motor.stop()
+                self.speed = 0.0
+            elif self.moving:
+                slow = (now - self.start_time < CFG["ramp_seconds"]) or \
+                       (nearest is not None and nearest < CFG["slow_zone_cm"])
+                if slow:
+                    self.speed = min(self.max_speed, CFG["slow_speed"])
+                    self.reason = "Running - slow zone / starting"
+                else:
+                    self.speed = self.max_speed
+                    self.reason = "Running - cruising"
+                motor.forward(self.speed)
+            else:
+                motor.stop()
+                self.speed = 0.0
+                if not self.latched:
+                    self.reason = "Idle - ready"
+
+    def start(self):
+        with self.lock:
+            if not self.safe_now:
+                return False, "Path not clear or sensors not ready - cannot start"
+            self.moving = True
+            self.latched = False
+            self.start_time = time.time()
+            self.reason = "Starting slowly"
+            return True, "Started"
+
+    def stop(self):
+        with self.lock:
+            self.moving = False
+            self.latched = False
+            self.reason = "Stopped by operator"
+        motor.stop()
+
+    def set_speed(self, v):
+        with self.lock:
+            self.max_speed = max(0.1, min(1.0, v))
+
+    def snapshot(self):
+        with self.lock:
+            return {**self.data, "moving": self.moving, "latched": self.latched,
+                    "reason": self.reason, "speed": self.speed, "max_speed": self.max_speed,
+                    "stop_cm": CFG["stop_distance_cm"], "safe": self.safe_now}
+
+
+train = Train()
+
+
+# ============================================================
+# WEB SERVER
+# ============================================================
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
+
+
+@app.before_request
+def check_token():
+    if request.endpoint in ("index", "static"):
+        return None
+    ok = request.headers.get("X-Token") == CFG["token"] or request.args.get("token") == CFG["token"]
+    if not ok:
+        return jsonify(error="unauthorized"), 401
+
+
+def clean_label(s):
+    return re.sub(r"[^a-z0-9_-]", "", s.lower().strip())
+
+
+def safe(name):
+    p = (BASE / name).resolve()
+    if p != BASE and BASE not in p.parents:
+        abort(400)
+    return p
+
+
+@app.get("/")
+def index():
+    return Response(HTML_PAGE, mimetype="text/html")
+
+
+@app.get("/video_feed")
+def video_feed():
+    def gen():
+        while True:
+            f = cam.get()
+            if f is not None:
+                ok, jpg = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ok:
+                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n"
+            time.sleep(0.07)
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/api/status")
+def status():
+    s = train.snapshot()
+    s["vision"] = {"label": vision.label, "confidence": round(vision.confidence, 2), "mode": vision.mode}
+    return jsonify(s)
+
+
+@app.post("/api/start")
+def start():
+    ok, msg = train.start()
+    return jsonify(ok=ok, message=msg)
+
+
+@app.post("/api/stop")
+def stop():
+    train.stop()
+    return jsonify(ok=True)
+
+
+@app.post("/api/speed")
+def speed():
+    train.set_speed(float(request.json["value"]))
+    return jsonify(ok=True)
+
+
+@app.post("/api/capture")
+def capture():
+    label = clean_label(request.json.get("label", ""))
+    if not label:
+        return jsonify(error="Enter a label first (e.g. clear, obstacle, person)"), 400
+    try:
+        name = vision.capture(label)
+    except RuntimeError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(ok=True, saved=f"{label}/{name}")
+
+
+@app.post("/api/dataset/upload")
+def dataset_upload():
+    label = clean_label(request.form.get("label", ""))
+    f = request.files.get("file")
+    if not label or not f:
+        return jsonify(error="Need a label and an image file"), 400
+    ext = Path(f.filename).suffix.lower()
+    if ext not in (".jpg", ".jpeg", ".png"):
+        return jsonify(error="Only jpg/png images"), 400
+    d = vision.dataset / label
+    d.mkdir(parents=True, exist_ok=True)
+    f.save(d / f"up_{int(time.time() * 1000)}{ext}")
+    return jsonify(ok=True)
+
+
+@app.get("/api/dataset")
+def dataset():
+    return jsonify(vision.counts())
+
+
+@app.get("/api/files")
+def files():
+    return jsonify(sorted(p.name for p in BASE.iterdir() if p.is_file()))
+
+
+@app.get("/api/file")
+def get_file():
+    return jsonify(content=safe(request.args["name"]).read_text(errors="replace"))
+
+
+@app.post("/api/file")
+def save_file():
+    d = request.json
+    safe(d["name"]).write_text(d["content"])
+    return jsonify(ok=True)
+
+
+@app.post("/api/upload")
+def upload():
+    f = request.files["file"]
+    name = secure_filename(f.filename)
+    if not name.endswith((".py", ".txt", ".json")):
+        return jsonify(error="Only .py, .txt, .json"), 400
+    f.save(safe(name))
+    return jsonify(ok=True, name=name)
+
+
+run_proc = None
+run_log = collections.deque(maxlen=1000)
+
+
+def _pump(proc):
+    for line in proc.stdout:
+        run_log.append(line)
+    run_log.append(f"\n[process exited with code {proc.wait()}]\n")
+
+
+@app.post("/api/run")
+def run_script():
+    global run_proc
+    name = request.json["name"]
+    if not name.endswith(".py"):
+        return jsonify(error="Only .py files can run"), 400
+    p = safe(name)
+    if run_proc and run_proc.poll() is None:
+        return jsonify(error="A script is already running"), 400
+    run_log.clear()
+    run_log.append(f"$ python3 {name}\n")
+    run_proc = subprocess.Popen(["python3", "-u", str(p)], cwd=str(BASE),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    threading.Thread(target=_pump, args=(run_proc,), daemon=True).start()
+    return jsonify(ok=True)
+
+
+@app.post("/api/run/stop")
+def run_stop():
+    if run_proc and run_proc.poll() is None:
+        run_proc.terminate()
+    return jsonify(ok=True)
+
+
+@app.get("/api/run/log")
+def run_log_route():
+    return jsonify(log="".join(run_log))
+
+
+term_cwd = str(BASE)
+
+
+@app.post("/api/terminal")
+def terminal():
+    global term_cwd
+    cmd = request.json.get("cmd", "").strip()
+    if not cmd:
+        return jsonify(out="")
+    if cmd == "cd" or cmd.startswith("cd "):
+        target = (Path(term_cwd) / cmd[3:].strip()).resolve()
+        if target.is_dir():
+            term_cwd = str(target)
+            return jsonify(out=f"cwd: {term_cwd}", cwd=term_cwd)
+        return jsonify(out="No such directory", cwd=term_cwd)
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=term_cwd, capture_output=True, text=True, timeout=60)
+        out = r.stdout + r.stderr
+    except subprocess.TimeoutExpired:
+        out = "Timed out after 60 seconds (interactive programs are not supported)"
+    return jsonify(out=out or "(no output)", cwd=term_cwd)
+
+
+@app.post("/api/shutdown")
+def shutdown():
+    train.stop()
+    subprocess.Popen(["sudo", "-n", "/usr/sbin/shutdown", "-h", "now"])
+    return jsonify(ok=True, message="Shutting down")
+
+
+# ============================================================
+# WEB PAGE (embedded)
+# ============================================================
+HTML_PAGE = r"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Railway Obstacle Control</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:12px}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+h2{margin:0;font-size:20px} h3{margin:0 0 8px;font-size:15px;color:#7fd}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+.card{background:#1d1d1d;border-radius:10px;padding:12px}
+button{background:#2b6;border:0;color:#000;padding:8px 12px;border-radius:6px;cursor:pointer;margin:3px;font-weight:600}
+button.red{background:#c33;color:#fff} button.grey{background:#555;color:#fff}
+input,select,textarea{background:#222;color:#eee;border:1px solid #444;border-radius:6px;padding:6px;margin:3px 0}
+textarea{width:100%;height:240px;font-family:monospace;box-sizing:border-box}
+pre{background:#000;color:#0f0;padding:8px;border-radius:6px;height:160px;overflow:auto;white-space:pre-wrap;font-size:12px;margin:6px 0}
+.bar{height:12px;background:#333;border-radius:6px;overflow:hidden;margin:4px 0 10px}
+.bar>div{height:100%;background:#4c8;width:0;transition:width .2s}
+.pill{padding:6px 12px;border-radius:14px;background:#333;font-weight:600;font-size:13px}
+img{width:100%;border-radius:8px;background:#000}
+.big{font-size:26px;font-weight:700}
+</style>
+</head>
+<body>
+<header>
+  <h2>🚆 Railway Obstacle Control</h2>
+  <span class="pill" id="state">connecting...</span>
+  <button class="red" onclick="shutdownPi()">⏻ Shut down Pi</button>
+</header>
+
+<div class="grid">
+
+  <div class="card">
+    <h3>Camera & Dataset</h3>
+    <img id="cam" alt="camera feed">
+    <div>Detected: <b id="label">-</b> <span id="conf"></span> <small id="vmode"></small></div>
+    <input id="label_in" placeholder="label: clear / obstacle / person">
+    <button onclick="capture()">📸 Capture frame</button><br>
+    <input type="file" id="upimg" accept="image/*">
+    <button onclick="uploadImg()">Upload image to label</button>
+    <pre id="dataset" style="height:80px"></pre>
+  </div>
+
+  <div class="card">
+    <h3>Sensors</h3>
+    HC-SR04 distance: <span class="big" id="us">-</span> cm
+    <div class="bar"><div id="us_bar"></div></div>
+    TF-Luna distance: <span class="big" id="lz">-</span> cm
+    <div class="bar"><div id="lz_bar"></div></div>
+    TF-Luna signal strength: <span id="st">-</span>
+    <div class="bar"><div id="st_bar" style="background:#fa3"></div></div>
+    TF-Luna temperature: <span id="tp">-</span> °C<br>
+    Nearest obstacle: <b id="near">-</b> cm (stop below <span id="stopcm"></span> cm)
+  </div>
+
+  <div class="card">
+    <h3>Train Control</h3>
+    <button onclick="startTrain()">▶ Start</button>
+    <button class="red" onclick="api('/api/stop',{})">■ Stop / E-STOP</button>
+    <div style="margin-top:8px">Max speed:
+      <input type="range" id="spd" min="10" max="100" value="65"
+             oninput="$('spdv').textContent=this.value+'%'" onchange="setSpeed(this.value)">
+      <span id="spdv">65%</span>
+    </div>
+    <div>Current motor power: <b id="pwm">0%</b></div>
+    <div>Status: <b id="moving">-</b> &nbsp; Latched (obstacle): <b id="latched">-</b></div>
+    <div style="margin-top:6px"><i id="reason"></i></div>
+  </div>
+
+  <div class="card">
+    <h3>Code Editor & Runner</h3>
+    <select id="files" size="5" style="width:100%" onchange="openFile(this.value)"></select>
+    <div>
+      <input type="file" id="upcode" accept=".py,.txt,.json">
+      <button onclick="uploadCode()">Upload file</button>
+    </div>
+    <input id="fname" placeholder="file name e.g. test_motor.py">
+    <button onclick="saveFile()">💾 Save</button>
+    <button onclick="runFile()">▶ Run</button>
+    <button class="grey" onclick="api('/api/run/stop',{})">Stop run</button>
+    <textarea id="code" spellcheck="false"></textarea>
+    <pre id="runlog"></pre>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <h3>Terminal</h3>
+    <pre id="term" style="height:220px"></pre>
+    <input id="cmd" style="width:75%" placeholder="e.g. ls, cd ~, python3 test.py"
+           onkeydown="if(event.key==='Enter')runCmd()">
+    <button onclick="runCmd()">Run command</button>
+  </div>
+
+</div>
+
+<script>
+let TOKEN = localStorage.getItem("tok") || prompt("Access token (from CFG token in railwayproject.py)") || "";
+localStorage.setItem("tok", TOKEN);
+const $ = id => document.getElementById(id);
+
+async function handle(r) {
+  if (r.status === 401) {
+    TOKEN = prompt("Wrong token. Enter access token") || "";
+    localStorage.setItem("tok", TOKEN);
+    $("cam").src = "/video_feed?token=" + encodeURIComponent(TOKEN);
+    return { error: "unauthorized" };
+  }
+  return r.json();
+}
+async function api(path, body) {
+  const opt = { method: body ? "POST" : "GET", headers: { "X-Token": TOKEN } };
+  if (body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  return handle(await fetch(path, opt));
+}
+async function postForm(path, fd) {
+  return handle(await fetch(path, { method: "POST", headers: { "X-Token": TOKEN }, body: fd }));
+}
+
+async function startTrain() {
+  const r = await api("/api/start", {});
+  if (r.error || r.ok === false) alert(r.message || r.error);
+}
+
+function setBar(id, val, max) {
+  $(id).style.width = val == null ? "0%" : Math.min(100, val / max * 100) + "%";
+}
+const show = v => (v == null ? "-" : v);
+
+async function poll() {
+  const s = await api("/api/status");
+  if (s.error) return;
+  $("us").textContent = show(s.us_cm);      setBar("us_bar", s.us_cm, 200);
+  $("lz").textContent = show(s.lidar_cm);   setBar("lz_bar", s.lidar_cm, 200);
+  $("st").textContent = show(s.lidar_strength); setBar("st_bar", s.lidar_strength, 1000);
+  $("tp").textContent = show(s.lidar_temp);
+  $("near").textContent = show(s.nearest);
+  $("stopcm").textContent = s.stop_cm;
+  $("label").textContent = s.vision.label;
+  $("conf").textContent = "(" + (s.vision.confidence * 100).toFixed(0) + "%)";
+  $("vmode").textContent = "[" + s.vision.mode + "]";
+  $("moving").textContent = s.moving ? "RUNNING" : "STOPPED";
+  $("latched").textContent = s.latched ? "YES" : "no";
+  $("pwm").textContent = (s.speed * 100).toFixed(0) + "%";
+  $("reason").textContent = s.reason;
+  $("state").textContent = s.reason;
+  $("state").style.background = s.latched ? "#c33" : s.moving ? "#2a6" : "#333";
+
+  const log = await api("/api/run/log");
+  if (log.log !== undefined) {
+    $("runlog").textContent = log.log;
+    $("runlog").scrollTop = $("runlog").scrollHeight;
+  }
+}
+
+function setSpeed(v) { api("/api/speed", { value: v / 100 }); }
+
+async function capture() {
+  const label = $("label_in").value;
+  const r = await api("/api/capture", { label });
+  alert(r.error ? r.error : "Saved " + r.saved);
+  loadDataset();
+}
+async function uploadImg() {
+  const f = $("upimg").files[0];
+  if (!f) return alert("Choose an image first");
+  const fd = new FormData();
+  fd.append("label", $("label_in").value);
+  fd.append("file", f);
+  const r = await postForm("/api/dataset/upload", fd);
+  alert(r.error ? r.error : "Image added to dataset");
+  loadDataset();
+}
+async function loadDataset() {
+  const c = await api("/api/dataset");
+  if (c.error) return;
+  $("dataset").textContent = Object.keys(c).length
+    ? Object.entries(c).map(([k, v]) => `${k}: ${v} images`).join("\n")
+    : "No dataset yet";
+}
+
+async function loadFiles() {
+  const list = await api("/api/files");
+  if (list.error) return;
+  $("files").innerHTML = list.map(n => `<option value="${n}">${n}</option>`).join("");
+}
+async function openFile(name) {
+  const r = await api("/api/file?name=" + encodeURIComponent(name));
+  if (r.content !== undefined) { $("code").value = r.content; $("fname").value = name; }
+}
+async function saveFile() {
+  const name = $("fname").value.trim();
+  if (!name) return alert("Enter a file name");
+  const r = await api("/api/file", { name, content: $("code").value });
+  if (r.error) alert(r.error); else loadFiles();
+}
+async function runFile() {
+  const name = $("fname").value.trim();
+  if (!name) return alert("Open or name a .py file first");
+  await saveFile();
+  const r = await api("/api/run", { name });
+  if (r.error) alert(r.error);
+}
+async function uploadCode() {
+  const f = $("upcode").files[0];
+  if (!f) return alert("Choose a file first");
+  const fd = new FormData();
+  fd.append("file", f);
+  const r = await postForm("/api/upload", fd);
+  alert(r.error ? r.error : "Uploaded " + r.name);
+  loadFiles();
+}
+
+async function runCmd() {
+  const c = $("cmd").value;
+  if (!c.trim()) return;
+  $("term").textContent += "\n$ " + c + "\n";
+  const r = await api("/api/terminal", { cmd: c });
+  $("term").textContent += (r.out || r.error || "") + "\n";
+  $("term").scrollTop = $("term").scrollHeight;
+  $("cmd").value = "";
+}
+
+function shutdownPi() {
+  if (confirm("Shut down the Raspberry Pi now?")) api("/api/shutdown", {});
+}
+
+$("cam").src = "/video_feed?token=" + encodeURIComponent(TOKEN);
+setInterval(poll, 300);
+setInterval(loadDataset, 3000);
+loadDataset();
+loadFiles();
+</script>
+</body>
+</html>
+"""
+
+
+# ============================================================
+# MAIN
+# ============================================================
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, threaded=True)
