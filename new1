@@ -1,2 +1,6 @@
 sudo apt update
 sudo apt install -y python3-flask python3-opencv python3-numpy python3-serial python3-gpiozero python3-picamera2
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, threaded=True)
