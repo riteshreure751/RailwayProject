@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+'''
+Single-file Railway obstacle detection dashboard.
+
+Setup on Raspberry Pi (from the original setup.sh):
+#!/bin/bash
+# Run once on the Pi (needs internet):  bash setup.sh
+set -e
+sudo apt update
+sudo apt install -y python3-picamera2 python3-opencv python3-numpy python3-gpiozero python3-lgpio python3-serial
+python3 -m venv --system-site-packages venv
+./venv/bin/pip install flask flask-sock
+sudo raspi-config nonint do_serial_hw 0   # enable UART for the TF-Luna
+sudo raspi-config nonint do_serial_cons 1 # disable login console on UART
+echo "Done. Reboot once, then run:  ./venv/bin/python server.py"
+
+'''
+#!/usr/bin/env python3
+"""Railway obstacle detection: Pi 5 + TF-Luna + HC-SR04 + camera + L298N.
+Run:  ./venv/bin/python server.py      (SIMULATE=1 to test without hardware)"""
+import os, sys, time, json, threading, subprocess, pty, signal, secrets, re, random
+from pathlib import Path
+import numpy as np, cv2
+from flask import Flask, Response, request, jsonify, session, redirect
+from flask_sock import Sock
+
+SIM = os.environ.get("SIMULATE") == "1"
+if not SIM: os.environ.setdefault("GPIOZERO_PIN_FACTORY", "lgpio")
+BASE = Path(__file__).resolve().parent
+CLS = BASE / "data" / "classes"; CLS.mkdir(parents=True, exist_ok=True)
+(BASE / "code").mkdir(exist_ok=True)
+MODEL = BASE / "classifier.npz"
+SETF = BASE / "settings.json"
+PIN = dict(ENA=18, IN1=5, IN3=6, TRIG=23, ECHO=24)
+LIDAR_PORT = "/dev/serial0"
+CFG = dict(stop_cm=60, slow_band_cm=80, cruise=50, slow=25, ramp_delay=5,
+           margin_per_pct=0.3, conf=0.6, use_camera=0, stop_on_disconnect=1)
+if SETF.exists(): CFG.update(json.loads(SETF.read_text()))
+SIMD = {"d": 250.0}
+def log(m): print(time.strftime("%H:%M:%S"), m, flush=True)
+
+# ---------------- sensors ----------------
+class Lidar(threading.Thread):
+    def __init__(s): super().__init__(daemon=True); s.d=s.st=s.seq=0; s.t=0; s.valid=False; s.err=None; s.temp=0
+    def run(s):
+        if SIM:
+            while True:
+                s.d=SIMD["d"]+random.uniform(-1,1); s.st=900; s.valid=True; s.t=time.time(); s.seq+=1; time.sleep(.01)
+        try:
+            import serial; ser = serial.Serial(LIDAR_PORT, 115200, timeout=.05)
+        except Exception as e: s.err=str(e); return
+        buf = b""
+        while True:
+            try: buf += ser.read(max(1, ser.in_waiting))
+            except Exception as e: s.err=str(e); return
+            while len(buf) >= 9:
+                f = buf[:9]
+                if f[0]==0x59 and f[1]==0x59 and sum(f[:8]) & 255 == f[8]:
+                    d=f[2]|f[3]<<8; st=f[4]|f[5]<<8
+                    s.valid = 100<=st<65535 and 0<d<=800
+                    s.d, s.st, s.temp, s.t = d, st, (f[6]|f[7]<<8)/8-256, time.time(); s.seq+=1
+                    buf = buf[9:]
+                else: buf = buf[1:]
+
+class Ultra(threading.Thread):
+    def __init__(s): super().__init__(daemon=True); s.d=s.seq=0; s.t=0; s.valid=False; s.err=None; s.st=0
+    def run(s):
+        if SIM:
+            while True:
+                s.d=SIMD["d"]+random.uniform(-1,1); s.valid=True; s.t=time.time(); s.seq+=1; time.sleep(.05)
+        try:
+            from gpiozero import DistanceSensor
+            ds = DistanceSensor(echo=PIN["ECHO"], trigger=PIN["TRIG"], max_distance=4, queue_len=3)
+        except Exception as e: s.err=str(e); return
+        while True:
+            d = ds.distance*100; s.valid = 2<=d<399
+            s.d, s.t = d, time.time(); s.seq+=1; time.sleep(.04)
+
+class Camera(threading.Thread):
+    def __init__(s):
+        super().__init__(daemon=True); s.frame=None; s.jpg=s.nojpg("STARTING CAMERA"); s.t=0; s.err=None; s.fps=0
+        s.cond=threading.Condition()
+    @staticmethod
+    def nojpg(msg):
+        im=np.zeros((480,640,3),np.uint8); cv2.putText(im,msg,(40,240),0,.9,(120,170,255),2)
+        return cv2.imencode(".jpg",im)[1].tobytes()
+    def push(s, img):
+        ok, j = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        with s.cond: s.frame, s.jpg, s.t = img, j.tobytes(), time.time(); s.cond.notify_all()
+    def run(s):
+        n, t0 = 0, time.time()
+        def tick():
+            nonlocal n, t0
+            n+=1
+            if time.time()-t0>=1: s.fps=n/(time.time()-t0); n=0; t0=time.time()
+        if SIM:
+            while True:
+                im=np.full((480,640,3),30,np.uint8); cv2.putText(im,"SIMULATED CAMERA",(150,240),0,1,(120,255,170),2)
+                s.push(im); tick(); time.sleep(.1)
+        try:
+            from picamera2 import Picamera2
+            cam = Picamera2(); cam.configure(cam.create_video_configuration(main={"size":(640,480),"format":"RGB888"})); cam.start()
+            grab = cam.capture_array
+        except Exception as e:
+            log(f"picamera2 unavailable ({e}); trying USB/OpenCV camera")
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened(): s.err="No camera found (check ribbon cable / camera enabled)"; s.jpg=s.nojpg("NO CAMERA"); return
+            grab = lambda: cap.read()[1]
+        while True:
+            try:
+                img = grab()
+                if img is None: time.sleep(.05); continue
+                s.push(img[:, :, :3]); tick()
+            except Exception as e: s.err=str(e); time.sleep(.5)
+
+# ---------------- classifier (kNN on HOG + colour; trains in seconds on the Pi) ----------------
+HOG = cv2.HOGDescriptor((64,64),(16,16),(8,8),(8,8),9)
+def feat(img):
+    h = HOG.compute(cv2.cvtColor(cv2.resize(img,(64,64)),cv2.COLOR_BGR2GRAY)).ravel()
+    c = cv2.calcHist([cv2.cvtColor(cv2.resize(img,(32,32)),cv2.COLOR_BGR2HSV)],[0,1,2],None,[8,4,4],[0,180,0,256,0,256]).ravel()
+    v = np.concatenate([h/(np.linalg.norm(h)+1e-6), c/(np.linalg.norm(c)+1e-6)])
+    return (v/np.linalg.norm(v)).astype(np.float32)
+M = {"X":None,"y":None,"names":[]}
+def load_model():
+    if MODEL.exists():
+        z=np.load(MODEL, allow_pickle=False); M.update(X=z["X"], y=z["y"], names=list(z["names"]))
+def train():
+    X, y, names = [], [], sorted(p.name for p in CLS.iterdir() if p.is_dir())
+    if len(names) < 2: return False, "Need at least 2 classes (e.g. clear + person)."
+    for i, n in enumerate(names):
+        for f in CLS.joinpath(n).glob("*"):
+            im = cv2.imread(str(f))
+            if im is None: continue
+            for a in (im, cv2.flip(im,1), cv2.convertScaleAbs(im,alpha=.8,beta=-10), cv2.convertScaleAbs(im,alpha=1.2,beta=15)):
+                X.append(feat(a)); y.append(i)
+    if len(set(y)) < 2: return False, "Each class needs images."
+    np.savez(MODEL, X=np.array(X), y=np.array(y), names=np.array(names)); load_model()
+    return True, f"Trained on {len(X)//4} images in {len(names)} classes."
+def predict(img):
+    if M["X"] is None: return None, 0.0, {}
+    s = M["X"] @ feat(img); idx = np.argsort(-s)[:5]
+    if s[idx[0]] < .5: return "unknown", 0.0, {}
+    v = {}
+    for i in idx: v[M["names"][M["y"][i]]] = v.get(M["names"][M["y"][i]],0) + max(float(s[i]),0)
+    tot = sum(v.values()); v = {k: round(x/tot,2) for k,x in v.items()}
+    lab = max(v, key=v.get); return lab, v[lab], v
+
+class Detector(threading.Thread):
+    def __init__(s): super().__init__(daemon=True); s.label=None; s.conf=0; s.scores={}; s.obstacle=False; s.seq=0; s.t=0
+    def run(s):
+        last = 0
+        while True:
+            time.sleep(.02)
+            if cam.t == last or cam.frame is None or M["X"] is None: continue
+            last = cam.t
+            l, c, sc = predict(cam.frame)
+            s.label, s.conf, s.scores = l, c, sc
+            s.obstacle = l not in (None,"unknown") and not l.lower().startswith("clear") and c >= CFG["conf"]
+            s.t, s.seq = last, s.seq+1
+
+# ---------------- motor ----------------
+class Motor:
+    def __init__(s):
+        s.err=None; s.pwm=None
+        if SIM: return
+        try:
+            from gpiozero import PWMOutputDevice, OutputDevice
+            s.pwm=PWMOutputDevice(PIN["ENA"],frequency=1000); s.in1=OutputDevice(PIN["IN1"]); s.in3=OutputDevice(PIN["IN3"])
+        except Exception as e: s.err=str(e)
+    def run(s,pct):
+        if s.pwm: s.in1.on(); s.in3.on(); s.pwm.value=max(0,min(100,pct))/100
+    def brake(s):   # IN1=IN3=LOW with EN high = fast motor stop on L298N
+        if s.pwm: s.in1.off(); s.in3.off(); s.pwm.value=1
+    def off(s):
+        if s.pwm: s.pwm.value=0; s.in1.off(); s.in3.off()
+
+class Controller(threading.Thread):
+    def __init__(s):
+        super().__init__(daemon=True); s.running=False; s.latched=False; s.reason="Ready"; s.cur=0.0
+        s.t0=0; s.clear_since=0; s.hits=dict(l=0,u=0,c=0); s.seq=dict(l=0,u=0,c=0); s.trig=dict(l=0,u=0,c=0)
+        s.react=None; s.zone="clear"; s.hb=time.time(); s.clients=0; s.lock=threading.Lock()
+    def eff(s): return CFG["stop_cm"] + CFG["margin_per_pct"]*s.cur
+    def check(s):
+        now, e, near = time.time(), s.eff(), 999
+        for k, sen, nm, lim, n in (("l",lid,"Lidar",.3,3),("u",ult,"Ultrasonic",.6,3)):
+            if sen.err or now-sen.t > lim: return f"{nm} not responding (fail-safe)", 0, near
+            if sen.seq != s.seq[k]:
+                s.seq[k]=sen.seq; s.trig[k]=sen.t
+                s.hits[k] = s.hits[k]+1 if (sen.valid and sen.d<=e) else 0
+            if sen.valid: near=min(near,sen.d)
+            if s.hits[k]>=n: return f"{nm}: obstacle at {sen.d:.0f} cm", s.trig[k], near
+        if CFG["use_camera"] and M["X"] is not None:
+            if now-det.t > 1.5: return "Camera not responding (fail-safe)", 0, near
+            if det.seq != s.seq["c"]:
+                s.seq["c"]=det.seq; s.trig["c"]=det.t; s.hits["c"] = s.hits["c"]+1 if det.obstacle else 0
+            if s.hits["c"]>=2: return f"Camera sees: {det.label} ({det.conf:.0%})", s.trig["c"], near
+        return None, 0, near
+    def estop(s, why, t_trig=0):
+        with s.lock:
+            motor.brake(); s.react = round((time.time()-t_trig)*1000) if t_trig else None
+            s.running=False; s.latched=True; s.cur=0; s.reason=why; log(f"STOP: {why} reaction={s.react}ms")
+            threading.Timer(.5, lambda: None if s.running else motor.off()).start()
+    def start(s):
+        if motor.err: return False, "Motor driver error: "+motor.err
+        if s.latched: return False, "Obstacle latch is set - clear the track and press Reset."
+        why, _, near = s.check()
+        if why: return False, why
+        if near <= s.eff()+CFG["slow_band_cm"]*.0 + 5: return False, f"Obstacle already within {near:.0f} cm"
+        s.hits=dict(l=0,u=0,c=0); s.running=True; s.t0=s.clear_since=time.time(); s.cur=0; s.reason="Running"; s.react=None; return True, "Started"
+    def stop(s):
+        with s.lock: s.running=False; s.cur=0; motor.brake(); s.reason="Stopped by operator"; threading.Timer(.4, lambda: None if s.running else motor.off()).start()
+    def reset(s):
+        why, _, near = s.check()
+        if why: return False, why
+        if near <= s.eff()+5: return False, f"Track not clear ({near:.0f} cm)"
+        s.latched=False; s.reason="Ready"; return True, "Reset"
+    def run(s):
+        dt=.01
+        while True:
+            time.sleep(dt)
+            if not s.running: continue
+            why, tt, near = s.check()
+            if not why and CFG["stop_on_disconnect"] and time.time()-s.hb > 3: why, tt = "Dashboard disconnected", 0
+            if why: s.estop(why, tt); continue
+            slow = near <= s.eff()+CFG["slow_band_cm"]
+            if slow and s.zone=="clear": s.clear_since=time.time()
+            s.zone = "slow" if slow else "clear"
+            cruise = max(CFG["cruise"], CFG["slow"])
+            target = CFG["slow"] if (slow or time.time()-s.clear_since < CFG["ramp_delay"]) else cruise
+            s.cur = min(target, s.cur+20*dt) if target > s.cur else max(target, s.cur-100*dt)
+            s.cur = max(s.cur, CFG["slow"]) if target >= CFG["slow"] else s.cur
+            motor.run(s.cur)
+
+def snap():
+    now=time.time(); sen=lambda x:dict(d=round(x.d,1),st=x.st,ok=not x.err and now-x.t<1,valid=x.valid,err=x.err)
+    try: cpu=int(open("/sys/class/thermal/thermal_zone0/temp").read())/1000
+    except Exception: cpu=None
+    return dict(sim=SIM, lidar=dict(sen(lid),temp=round(lid.temp,1)), ultra=sen(ult),
+        cam=dict(ok=not cam.err and now-cam.t<2, err=cam.err, fps=round(cam.fps,1), trained=M["X"] is not None, label=det.label, conf=round(det.conf,2), scores=det.scores, obstacle=det.obstacle),
+        motor=dict(running=ctl.running, latched=ctl.latched, speed=round(ctl.cur), reason=ctl.reason, zone=ctl.zone, eff=round(ctl.eff()), react=ctl.react, err=motor.err),
+        cfg=CFG, cpu=cpu)
+
+
+
+# ---------------- embedded dashboard page ----------------
+INDEX_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Railway obstacle detection</title>
+<style>
+:root{--bg:#0b1014;--p1:#172127;--p2:#12191e;--line:#263239;--tx:#edf4f0;--mu:#91a0a5;--g:#7bdfa6;--b:#69baf0;--a:#ffd784;--r:#ff8a80}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(#10211f,var(--bg) 260px) no-repeat var(--bg);color:var(--tx);font:15px/1.45 system-ui,sans-serif}
+.w{max-width:1360px;margin:0 auto;padding:20px}h1{margin:0;font-size:32px}h2{margin:0 0 12px;font-size:21px}
+header{display:flex;justify-content:space-between;align-items:end;margin-bottom:16px}.sub{color:var(--mu);font-size:13px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.card{background:linear-gradient(135deg,var(--p1),var(--p2));border:1px solid var(--line);border-radius:14px;padding:18px;min-width:0}.full{grid-column:1/-1}
+#status{display:flex;align-items:center;gap:14px;padding:16px 18px;border-radius:12px;border:1px solid #2d5540;background:#14221d}
+#dot{width:14px;height:14px;border-radius:50%;background:var(--g)}#status.run{border-color:#2d5540}#status.slow{background:#2b2819;border-color:#725b2e}#status.stop{background:#2b1717;border-color:#7a3535}
+#status b{font-size:18px}.pill{border:1px solid var(--line);border-radius:99px;padding:3px 12px;font-size:12px;color:var(--mu);margin-left:auto;white-space:nowrap}
+img#cam{width:100%;border-radius:8px;background:#080d10;border:1px solid #283237;display:block;aspect-ratio:4/3;object-fit:contain}
+.row{display:flex;justify-content:space-between;align-items:baseline;margin-top:14px}.val{font:600 20px ui-monospace,monospace}.mu{color:var(--mu);font-size:13px}
+.bar{position:relative;height:8px;border-radius:4px;background:#25312e;margin-top:6px}.bar i{position:absolute;left:0;top:0;bottom:0;border-radius:4px;background:var(--g);transition:width .08s}.bar u{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--r)}
+button,.btn{font:600 14px system-ui;border:0;border-radius:7px;padding:12px 16px;cursor:pointer;color:#fff;background:#25343b}button.sm{padding:7px 12px;font-size:13px}
+.go{background:#368d5d}.no{background:#552a2b;color:#ffb3ae}.dg{background:#7a1f1f}button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--b);outline-offset:2px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:10px}input[type=range]{width:100%;accent-color:var(--g)}
+input,textarea,select{background:#0d1418;color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:8px;font:13px ui-monospace,monospace;max-width:100%}
+textarea{width:100%;min-height:240px;tab-size:4;white-space:pre}pre{margin:8px 0 0;background:#0d1418;border:1px solid var(--line);border-radius:6px;padding:10px;height:220px;overflow:auto;font:12.5px ui-monospace,monospace;white-space:pre-wrap}
+.cls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 0;border-top:1px solid var(--line)}.cls b{min-width:90px}.f{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.file{cursor:pointer;padding:2px 0;font:13px ui-monospace,monospace;color:#cbd7d5}.file:hover{color:var(--g)}#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#1d2a30;border:1px solid var(--line);padding:10px 18px;border-radius:8px;display:none}
+</style></head><body><div class="w">
+<header><div><div class="sub">Railway safety console</div><h1>Obstacle detection</h1></div><div class="pill" id="mode"></div></header>
+<div id="status"><span id="dot"></span><div><b id="st">Connecting…</b><div class="mu" id="st2"></div></div><span class="pill" id="mot">MOTOR OFF</span></div>
+
+<div class="grid">
+<section class="card"><h2>Live camera</h2><img id="cam" alt="Live camera">
+ <div class="row"><span class="mu">Detected object</span><span class="val" id="det">–</span></div>
+ <div class="bar"><i id="detbar" style="width:0"></i></div><div class="mu" id="scores" style="margin-top:6px"></div><div class="mu" id="camst"></div></section>
+
+<section class="card"><h2>Track clearance</h2>
+ <div class="mu">Red mark = stop distance at the current speed. Any close reading from lidar, ultrasonic or camera stops the train.</div>
+ <div class="row"><span>TF-Luna lidar</span><span class="val" id="ld">–</span></div><div class="bar"><i id="ldb"></i><u class="sl"></u></div>
+ <div class="row"><span class="mu">Signal strength (valid: 100–65534)</span><span class="val" style="font-size:15px;color:var(--b)" id="ls">–</span></div>
+ <div class="mu" id="lt"></div>
+ <div class="row"><span>HC-SR04 ultrasonic</span><span class="val" id="ud">–</span></div><div class="bar"><i id="ub" style="background:var(--b)"></i><u class="sl"></u></div>
+ <div class="mu" id="ut" style="margin-top:6px"></div>
+ <div class="row"><span class="mu">Stop reaction (last event)</span><span class="val" style="font-size:15px" id="react">–</span></div>
+ <div id="simbox" style="display:none"><div class="mu" style="margin-top:12px">Simulation: move a virtual obstacle</div><input type="range" min="10" max="400" value="250" oninput="api('/api/sim',{d:this.value},1)"></div></section>
+
+<section class="card"><h2>Train controls</h2>
+ <div class="two"><button class="go" onclick="api('/api/start')">▶ Start train</button><button class="no" onclick="api('/api/stop')">■ Stop</button></div>
+ <div class="row"><span>Cruise speed</span><span class="val" style="font-size:15px" id="spv"></span></div>
+ <input type="range" id="sp" min="25" max="100" onchange="set({cruise:this.value})" oninput="spv.textContent=this.value+'%'">
+ <div class="mu">Starts slow, ramps to cruise speed after the delay with a clear track, and drops to slow near an obstacle.</div>
+ <div class="row"><span>Stop distance</span><span class="val" style="font-size:15px" id="sdv"></span></div>
+ <input type="range" id="sd" min="15" max="250" onchange="set({stop_cm:this.value})" oninput="sdv.textContent=this.value+' cm'">
+ <div class="row"><span>Camera confidence needed</span><span class="val" style="font-size:15px" id="cfv"></span></div>
+ <input type="range" id="cf" min="30" max="95" onchange="set({conf:this.value/100})" oninput="cfv.textContent=this.value+'%'">
+ <div class="f"><button class="sm" onclick="api('/api/reset')">Reset obstacle latch</button>
+ <label class="mu"><input type="checkbox" id="usecam" onchange="set({use_camera:this.checked?1:0})"> Camera stops the train (needs trained model)</label></div></section>
+
+<section class="card"><h2>Dataset &amp; detection</h2>
+ <div class="f" style="margin:0"><input id="newc" placeholder="class name (e.g. clear, person)"><button class="sm" onclick="addc()">Add class</button><button class="sm go" onclick="train()">Train model</button></div>
+ <div id="classes"></div><div class="mu" style="margin-top:8px">Make a class called <b>clear</b> with empty-track photos; every other class counts as an obstacle. Capture 30+ images per class from different angles/lighting, then train.</div></section>
+
+<section class="card full"><h2>Code (Thonny files)</h2>
+ <div class="f" style="margin:0"><input type="file" id="upf" multiple accept=".py,.txt,.json,.csv,.sh"><button class="sm" onclick="upload()">Upload to code/</button><span class="mu" id="cwd"></span></div>
+ <div class="grid" style="grid-template-columns:240px 1fr;margin-top:10px"><div id="files"></div><div>
+  <input id="fp" placeholder="file path" style="width:100%"><textarea id="ed" spellcheck="false"></textarea>
+  <div class="f"><button class="sm go" onclick="save()">Save</button><button class="sm" onclick="runf()">▶ Run</button><button class="sm no" onclick="api('/api/run/stop')">■ Kill</button><span class="mu">Scripts that use GPIO 5/6/18/23/24 or the camera clash with this dashboard while it runs.</span></div>
+  <pre id="out" style="height:150px"></pre></div></div></section>
+
+<section class="card full"><h2>Terminal</h2><pre id="tm" tabindex="0" style="height:300px"></pre>
+ <div class="f"><input id="ti" style="flex:1" placeholder="type a command, press Enter" autocomplete="off"><button class="sm" onclick="tsend('\x03')">Ctrl-C</button><button class="sm" onclick="tm.textContent=''">Clear</button></div></section>
+
+<section class="card full"><h2>Power</h2><div class="f" style="margin:0"><button class="sm" onclick="if(confirm('Restart the dashboard program?'))api('/api/restart')">Restart dashboard</button>
+ <button class="dg" onclick="if(confirm('Shut down the Raspberry Pi?'))api('/api/shutdown')">⏻ Shut down Raspberry Pi</button><span class="mu" id="cpu"></span></div></section>
+</div><div id="toast"></div></div>
+<script>
+const $=id=>document.getElementById(id);let S=null,t0;
+function toast(m){const t=$('toast');t.textContent=m;t.style.display='block';clearTimeout(t0);t0=setTimeout(()=>t.style.display='none',3500)}
+async function api(u,b,quiet){try{const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json();if(!quiet&&j.msg)toast(j.msg);return j}catch(e){toast('Request failed')}}
+const set=o=>api('/api/settings',o,1);
+// camera stream with auto-reconnect
+function cam(){$('cam').src='/video_feed?'+Date.now()}$('cam').onerror=()=>setTimeout(cam,1500);cam();
+// telemetry
+let ws;function conn(){ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+'/ws');
+ ws.onmessage=e=>{S=JSON.parse(e.data);render()};ws.onclose=()=>{$('st').textContent='Connection lost – retrying…';$('status').className='stop';setTimeout(conn,1000)}}
+conn();setInterval(()=>{if(ws&&ws.readyState==1)ws.send('hb')},1000);
+const col=(d,e,b)=>d<=e?'var(--r)':d<=e+b?'var(--a)':'var(--g)';
+function sens(p,s,e,b,max){const el=$(p+'d');if(!s.ok){el.textContent='NO DATA';el.style.color='var(--r)';$(p+'b').style.width='0';return}
+ el.textContent=s.d.toFixed(1)+' cm'+(s.valid?'':' ?');el.style.color=s.valid?col(s.d,e,b):'var(--mu)';
+ const bar=$(p+'b');bar.style.width=Math.min(100,s.d/max*100)+'%';bar.style.background=p=='l'?col(s.d,e,b):'var(--b)'}
+function render(){const m=S.motor,c=S.cfg,e=m.eff;
+ $('mode').textContent=S.sim?'SIMULATION MODE':'LIVE HARDWARE';$('mode').style.color=S.sim?'var(--a)':'var(--g)';$('simbox').style.display=S.sim?'block':'none';
+ const stat=$('status');let cls='run',t,s2=m.reason;
+ if(m.latched){cls='stop';t='STOPPED – '+m.reason;s2='Press Reset obstacle latch once the track is clear.'}
+ else if(m.running){t=m.zone=='slow'?'Slowing – object ahead':'Running';cls=m.zone=='slow'?'slow':'run';s2='Speed '+m.speed+'%'}
+ else t='Ready';
+ stat.className=cls;$('st').textContent=t;$('st2').textContent=s2;$('dot').style.background=cls=='stop'?'var(--r)':cls=='slow'?'var(--a)':'var(--g)';
+ $('mot').textContent=m.running?'MOTOR '+m.speed+'%':'MOTOR OFF';
+ sens('l',S.lidar,e,c.slow_band_cm,400);sens('u',S.ultra,e,c.slow_band_cm,400);
+ document.querySelectorAll('.sl').forEach(u=>u.style.left=Math.min(100,e/400*100)+'%');
+ $('ls').textContent=S.lidar.ok?S.lidar.st:'–';$('lt').textContent=S.lidar.err?'Lidar error: '+S.lidar.err:(S.lidar.ok?'Sensor temp '+S.lidar.temp+' °C':'');
+ $('ut').textContent=S.ultra.err?'Ultrasonic error: '+S.ultra.err:'';
+ $('react').textContent=m.react!=null?m.react+' ms':'–';
+ const k=S.cam;$('det').textContent=k.trained?(k.label||'–')+(k.label?' '+Math.round(k.conf*100)+'%':''):'Not trained';
+ $('det').style.color=k.obstacle?'var(--r)':'var(--g)';$('detbar').style.width=(k.conf*100)+'%';
+ $('scores').textContent=Object.entries(k.scores).map(([a,b])=>a+' '+Math.round(b*100)+'%').join('  ');
+ $('camst').textContent=k.err?'Camera error: '+k.err:(k.ok?'Camera live · '+k.fps+' fps':'Camera not delivering frames');
+ if(document.activeElement.id!='sp'){$('sp').value=c.cruise;$('spv').textContent=c.cruise+'%'}
+ if(document.activeElement.id!='sd'){$('sd').value=c.stop_cm;$('sdv').textContent=c.stop_cm+' cm (+'+Math.round(e-c.stop_cm)+' at speed)'}
+ if(document.activeElement.id!='cf'){$('cf').value=c.conf*100;$('cfv').textContent=Math.round(c.conf*100)+'%'}
+ $('usecam').checked=!!c.use_camera;$('cpu').textContent=S.cpu?'Pi CPU '+S.cpu.toFixed(0)+' °C':''}
+// dataset
+async function ds(){const d=await (await fetch('/api/dataset')).json();$('classes').innerHTML='';
+ for(const [n,c] of Object.entries(d)){const r=document.createElement('div');r.className='cls';
+  r.innerHTML=`<b>${n}</b><span class="mu">${c} images</span><button class="sm" onclick="cap('${n}',1)">Capture</button><button class="sm" onclick="cap('${n}',10)">Capture ×10</button><label class="btn sm" style="display:inline-block">Upload<input type="file" multiple accept="image/*" hidden onchange="upi('${n}',this)"></label><button class="sm no" onclick="delc('${n}')">Delete</button>`;$('classes').append(r)}}
+async function addc(){const n=$('newc').value.trim();if(n){await api('/api/class/'+encodeURIComponent(n));$('newc').value='';ds()}}
+async function cap(n,k){toast('Capturing…');await api('/api/class/'+n+'/capture?n='+k);ds()}
+async function upi(n,i){const f=new FormData();[...i.files].forEach(x=>f.append('files',x));const r=await(await fetch('/api/class/'+n+'/upload',{method:'POST',body:f})).json();toast(r.msg);ds()}
+async function delc(n){if(confirm('Delete class '+n+' and its images?')){await fetch('/api/class/'+n,{method:'DELETE'});ds()}}
+async function train(){toast('Training…');await api('/api/train');ds()}
+// files
+let cwd='.';async function ls(p){cwd=p||'.';$('cwd').textContent='/'+(cwd=='.'?'':cwd);const l=await(await fetch('/api/files?path='+encodeURIComponent(cwd))).json();$('files').innerHTML='';
+ if(cwd!='.'){const u=document.createElement('div');u.className='file';u.textContent='📁 ..';u.onclick=()=>ls(cwd.includes('/')?cwd.slice(0,cwd.lastIndexOf('/')):'.');$('files').append(u)}
+ l.forEach(f=>{const d=document.createElement('div');d.className='file';d.textContent=(f.dir?'📁 ':'📄 ')+f.name;d.onclick=()=>f.dir?ls(f.path):openf(f.path);$('files').append(d)})}
+async function openf(p){$('fp').value=p;$('ed').value=await(await fetch('/api/file?path='+encodeURIComponent(p))).text()}
+async function save(){const r=await(await fetch('/api/file',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:$('fp').value,content:$('ed').value})})).json();toast(r.msg||'Saved');ls(cwd)}
+async function upload(){const f=new FormData();[...$('upf').files].forEach(x=>f.append('files',x));f.append('dir','code');await fetch('/api/upload',{method:'POST',body:f});toast('Uploaded');ls('code')}
+async function runf(){await save();await api('/api/run',{path:$('fp').value});poll()}
+async function poll(){const j=await(await fetch('/api/run/out')).json();$('out').textContent=j.out;$('out').scrollTop=1e9;if(j.running)setTimeout(poll,600)}
+$('ed').addEventListener('keydown',e=>{if(e.key=='Tab'){e.preventDefault();const s=e.target.selectionStart;e.target.setRangeText('    ',s,e.target.selectionEnd,'end')}});
+// terminal (line based; ANSI stripped)
+let tw;function tconn(){tw=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+'/term');
+ tw.onmessage=e=>{let t=e.data.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\][^\x07]*\x07/g,'').replace(/\r(?!\n)/g,'');let o=$('tm').textContent;
+  for(const ch of t)o=ch=='\b'||ch=='\x7f'?o.slice(0,-1):o+ch;$('tm').textContent=o.slice(-20000);$('tm').scrollTop=1e9};
+ tw.onclose=()=>setTimeout(tconn,2000)}tconn();
+const tsend=d=>tw.readyState==1&&tw.send(d);
+$('ti').addEventListener('keydown',e=>{if(e.key=='Enter'){tsend($('ti').value+'\n');$('ti').value=''}});
+ds();ls('code');
+</script></body></html>
+'''
+# ---------------- web ----------------
+app = Flask(__name__); sock = Sock(app)
+PWF = BASE/".dashboard_password"
+if not PWF.exists(): PWF.write_text(secrets.token_urlsafe(8)); PWF.chmod(0o600)
+PW = PWF.read_text().strip(); app.secret_key = secrets.token_hex(16)
+
+@app.before_request
+def auth():
+    if request.path in ("/login",) or request.path.startswith("/static/") or session.get("ok"): return
+    return redirect("/login") if request.method=="GET" and not request.path.startswith("/api") else ("auth", 401)
+@app.route("/login", methods=["GET","POST"])
+def login():
+    if request.method=="POST" and secrets.compare_digest(request.form.get("pw",""), PW): session["ok"]=1; return redirect("/")
+    return '<body style="background:#0b1014;color:#edf4f0;font:16px system-ui;display:grid;place-items:center;height:90vh"><form method=post>Dashboard password<br><br><input type=password name=pw autofocus style="padding:8px"> <button style="padding:8px">Enter</button></form>'
+@app.route("/")
+def index(): return Response(INDEX_HTML, mimetype="text/html")
+@app.route("/video_feed")
+def video_feed():
+    def gen():
+        last=0
+        while True:
+            with cam.cond: cam.cond.wait_for(lambda: cam.t!=last, 2); last=cam.t; j=cam.jpg
+            yield b"--f\r\nContent-Type: image/jpeg\r\n\r\n"+j+b"\r\n"
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=f")
+@sock.route("/ws")
+def ws_tel(ws):
+    ctl.clients+=1; last=0
+    try:
+        while True:
+            m = ws.receive(timeout=.05)
+            if m: ctl.hb=time.time()
+            if time.time()-last>=.05: ws.send(json.dumps(snap())); last=time.time()
+    except Exception: pass
+    finally: ctl.clients-=1
+@sock.route("/term")
+def term(ws):
+    if not session.get("ok"): return
+    pid, fd = pty.fork()
+    if pid==0: os.chdir(BASE); os.environ["TERM"]="dumb"; os.execvp("bash",["bash","-i"])
+    def rd():
+        try:
+            while True:
+                d=os.read(fd,4096)
+                if not d: break
+                ws.send(d.decode("utf-8","replace"))
+        except Exception: pass
+    threading.Thread(target=rd,daemon=True).start()
+    try:
+        while True:
+            m=ws.receive()
+            if m is None: break
+            os.write(fd,m.encode())
+    except Exception: pass
+    finally:
+        try: os.kill(pid,signal.SIGHUP); os.waitpid(pid,0)
+        except Exception: pass
+
+def J(ok,msg="",**k): return jsonify(ok=ok,msg=msg,**k)
+@app.post("/api/start")
+def a_start(): ctl.hb=time.time(); return J(*ctl.start())
+@app.post("/api/stop")
+def a_stop(): ctl.stop(); return J(True,"Stopped")
+@app.post("/api/reset")
+def a_reset(): return J(*ctl.reset())
+@app.post("/api/settings")
+def a_set():
+    for k,v in request.json.items():
+        if k in CFG: CFG[k]=float(v) if "." in str(v) else int(v)
+    SETF.write_text(json.dumps(CFG)); return J(True)
+@app.post("/api/sim")
+def a_sim(): SIMD["d"]=float(request.json["d"]); return J(True)
+@app.post("/api/shutdown")
+def a_shutdown():
+    ctl.stop(); log("Shutdown requested")
+    threading.Timer(1, lambda: subprocess.Popen(["sudo","-n","shutdown","-h","now"])).start(); return J(True,"Shutting down...")
+@app.post("/api/restart")
+def a_restart():
+    ctl.stop()
+    def go(): time.sleep(1); motor.off(); os.execv(sys.executable,[sys.executable]+sys.argv)
+    threading.Thread(target=go).start(); return J(True,"Restarting...")
+
+def cname(n): return re.sub(r"[^A-Za-z0-9_-]","",n)[:30]
+@app.get("/api/dataset")
+def a_ds():
+    return jsonify({p.name: len(list(p.glob("*"))) for p in sorted(CLS.iterdir()) if p.is_dir()})
+@app.post("/api/class/<n>")
+def a_cls(n): (CLS/cname(n)).mkdir(exist_ok=True); return J(True)
+@app.delete("/api/class/<n>")
+def a_cls_del(n):
+    import shutil; shutil.rmtree(CLS/cname(n), ignore_errors=True); return J(True)
+@app.post("/api/class/<n>/capture")
+def a_cap(n):
+    d=CLS/cname(n); d.mkdir(exist_ok=True); k=int(request.args.get("n",1))
+    for _ in range(k):
+        if cam.frame is None: return J(False,"No camera frame")
+        cv2.imwrite(str(d/f"{int(time.time()*1000)}.jpg"), cam.frame); time.sleep(.25)
+    return J(True,f"Saved {k} image(s)")
+@app.post("/api/class/<n>/upload")
+def a_up_img(n):
+    d=CLS/cname(n); d.mkdir(exist_ok=True); c=0
+    for f in request.files.getlist("files"):
+        im=cv2.imdecode(np.frombuffer(f.read(),np.uint8),1)
+        if im is not None: cv2.imwrite(str(d/f"u{int(time.time()*1000)}_{c}.jpg"), im); c+=1
+    return J(True,f"Added {c} image(s)")
+@app.post("/api/train")
+def a_train(): return J(*train())
+
+def safe(p):
+    q=(BASE/p).resolve()
+    if BASE not in q.parents and q!=BASE: raise ValueError("outside project")
+    return q
+@app.get("/api/files")
+def a_files():
+    d=safe(request.args.get("path","."))
+    return jsonify([dict(name=p.name,dir=p.is_dir(),size=p.stat().st_size,path=str(p.relative_to(BASE))) for p in sorted(d.iterdir(), key=lambda p:(not p.is_dir(),p.name)) if not p.name.startswith(".") and p.name!="venv" and p.name!="__pycache__"])
+@app.get("/api/file")
+def a_file(): return Response(safe(request.args["path"]).read_text(errors="replace"), mimetype="text/plain")
+@app.put("/api/file")
+def a_file_save(): safe(request.json["path"]).write_text(request.json["content"]); return J(True,"Saved")
+@app.post("/api/upload")
+def a_upload():
+    d=safe(request.form.get("dir","code")); d.mkdir(exist_ok=True)
+    for f in request.files.getlist("files"): f.save(d/re.sub(r"[^\w.\- ]","_",f.filename))
+    return J(True,"Uploaded")
+RUN={"p":None,"out":[]}
+@app.post("/api/run")
+def a_run():
+    if RUN["p"] and RUN["p"].poll() is None: return J(False,"Something is already running")
+    RUN["out"]=[]; p=RUN["p"]=subprocess.Popen([sys.executable,"-u",str(safe(request.json["path"]))],cwd=BASE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+    threading.Thread(target=lambda:[RUN["out"].append(l) for l in p.stdout],daemon=True).start(); return J(True,"Running")
+@app.post("/api/run/stop")
+def a_run_stop():
+    if RUN["p"] and RUN["p"].poll() is None: RUN["p"].terminate()
+    return J(True)
+@app.get("/api/run/out")
+def a_run_out(): return jsonify(out="".join(RUN["out"][-300:]), running=bool(RUN["p"] and RUN["p"].poll() is None))
+
+lid, ult, cam, det, motor, ctl = Lidar(), Ultra(), Camera(), None, Motor(), None
+det = Detector(); ctl = Controller(); load_model()
+def bye(*a): motor.off(); os._exit(0)
+signal.signal(signal.SIGTERM, bye); signal.signal(signal.SIGINT, bye)
+if __name__ == "__main__":
+    for t in (lid, ult, cam, det, ctl): t.start()
+    log(f"Dashboard: http://<pi-ip>:8000   password: {PW}   {'(SIMULATION)' if SIM else ''}")
+    app.run(host="0.0.0.0", port=8000, threaded=True)
