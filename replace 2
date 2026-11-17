@@ -1,0 +1,10 @@
+$('#btnShut').onclick=()=>$('#modal').classList.add('on');
+$('#mNo').onclick=()=>$('#modal').classList.remove('on');
+$('#mYes').onclick=async()=>{
+  const yes=$('#mYes');yes.disabled=true;yes.textContent='Shutting down...';
+  const r=await J('/api/shutdown');
+  $('#modal').classList.remove('on');yes.disabled=false;yes.textContent='Shut down';
+  if(r.ok){
+    document.body.innerHTML='<div style="display:flex;height:100vh;align-items:center;justify-content:center;flex-direction:column;background:#0a101c;color:#e9efff;font-family:sans-serif;text-align:center;padding:20px"><h1>Raspberry Pi is shutting down</h1><p style="color:#9db0d3;font-size:18px">Wait about 15-20 seconds until the green LED stops blinking and stays off.<br>Then switch off the battery.</p></div>';
+  }else toast(r.error||'Shutdown failed');
+};
