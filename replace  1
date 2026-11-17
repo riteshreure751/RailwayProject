@@ -1,0 +1,21 @@
+def _poweroff_now():
+    time.sleep(0.3)                      # lets the HTTP reply reach the browser first
+    for cmd in (["shutdown", "-h", "now"] if os.geteuid() == 0 else ["sudo", "-n", "shutdown", "-h", "now"],
+                ["sudo", "-n", "systemctl", "poweroff"],
+                ["sudo", "-n", "poweroff"]):
+        try:
+            if subprocess.call(cmd) == 0:
+                return
+        except Exception:
+            pass
+
+
+@app.route("/api/shutdown", methods=["POST"])
+def api_shutdown():
+    if os.name != "posix":
+        return jsonify(ok=False, error="Shutdown only works on the Raspberry Pi")
+    if os.geteuid() != 0 and subprocess.call(["sudo", "-n", "true"], stderr=subprocess.DEVNULL) != 0:
+        return jsonify(ok=False, error="No permission: add a NOPASSWD sudo rule for shutdown (see setup notes)")
+    train.stop("Shutdown")               # motor off first
+    threading.Thread(target=_poweroff_now, daemon=True).start()
+    return jsonify(ok=True)
